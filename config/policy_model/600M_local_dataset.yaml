@@ -1,0 +1,83 @@
+shared:
+  output_path: ${USER}/policy_model/600M
+  n_seq_timesteps: 200
+  frame_height: 192
+  frame_width: 192
+  text_tokenizer_config:
+    text_tokenizer_name: "gemma"
+    text_embedding_shape: [1, 768]
+    text_annotation_model_version: ["gemini-2.5-flash", "gemini-2.5-flash-thinking-0905"]
+  tokenizer:
+    type: "conv"
+    conv_tokenizer_config:
+      num_tokens: 1
+  precision: "bf16-mixed"
+
+inference:
+  mouse_sampling_approach: "truncated_normal"
+
+# 600M 尺度（可根据官方 600M 配置调整；此处给出放大版示例）
+policy_model:
+  n_transformer_layers: 20
+  n_q_head: 16
+  n_kv_head: 16
+  n_thinking_tokens: 1
+  transformer_dim: &transformer_dim 1536
+  mask_block_size: 128
+  attention_history_len: [200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200]
+  n_kv_sink_tokens: 0
+  model_type: "dense"
+  action_decoder:
+    embed_dim: *transformer_dim
+
+stage3_finetune:
+  optim:
+    learning_rate: 0.0001
+    weight_decay: 0.0001
+    beta_1: 0.9
+    beta_2: 0.999
+
+  validation_step_interval: 20000
+  n_validation_steps: &n_validation_steps 200
+  save_every_n_steps: 10000
+  n_training_steps: 500000
+  accumulate_grad_batches: 1
+
+  training_dataset:
+    batch_size: &stage3_batch_size 1   # 600M 建议从 1 起步，显存允许再尝试 2
+    local_prefix: "dataset"
+    warn_on_starvation: false
+    always_labelled: true
+    rand_augmentation:
+      fraction_augmented: 0.5          # 先减半，观察性能/显存后再调高
+      augmentations:
+        - spatial_transform
+        - color
+        - planckian
+        - iso_noise
+        - translation
+        - random_blur
+        - sharpness
+    # ⚠️ 注意：已设为最小配置以避免 /dev/shm 空间不足
+    n_preprocess_threads_per_gpu: 1  # 降到 1，单线程最小化共享内存
+    preprocessed_chunks_queue_size_per_gpu: 16  # 降到 16
+    shuffle_buffer_size_per_gpu: 200  # 降到 200
+    dataset_worker_num_workers_per_gpu: 1
+    dataset_worker_prefetch_factor: 2  # 降到 2
+    shuffled_chunks_queue_size_per_gpu: 2  # 降到 2
+
+  validation_datasets:
+    - batch_size: *stage3_batch_size
+      local_prefix: "dataset"
+      validation_name: "overall"
+      n_preprocess_threads_per_gpu: 1  # 同步降低
+      preprocessed_chunks_queue_size_per_gpu: 1
+      shuffled_chunks_queue_size_per_gpu: 1
+      dataset_worker_prefetch_factor: 2  # 同步降低
+      warn_on_starvation: false
+      always_labelled: true
+
+wandb:
+  enabled: false  # 暂时禁用，避免 API key 问题
+  project: "policy_model"
+  exp_name: "600M-local-dataset"

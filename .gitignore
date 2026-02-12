@@ -1,0 +1,47 @@
+# 虚拟环境
+.venv/
+
+# IDE / 编辑器缓存
+.vscode/
+.cursor/
+.idea/
+
+# 本地开发工具 / 生成配置
+.specstory/
+.cursorindexingignore
+configure_wsl.ps1
+recap_md/FIX_GSTREAMER_WARNING.ps1
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# 操作系统杂项
+.DS_Store
+Thumbs.db
+
+# 训练产生的文件 / 大目录
+output/
+.elefant_temp/
+logs/
+wandb/
+dataset/
+checkpoints/
+nitrogen_datasets/
+dataset_toy/
+elefant_rust/target/
+
+# 各种模型权重 / 大文件
+*.ckpt
+*.pt
+*.pth
+*.log
+
+# 大型归档批次文件
+batch_*.tar.gz
+
+# 排除所有分析文档（AI对话生成的md文件）
+*.md
+!README.md

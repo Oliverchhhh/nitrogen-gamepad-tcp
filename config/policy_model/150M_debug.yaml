@@ -1,0 +1,86 @@
+shared:
+  # 调试版输出目录，不覆盖正式训练结果
+  output_path: output/policy_model/150M_debug
+  # 时间序列长度大大缩短，减少显存和计算量
+  n_seq_timesteps: 20
+  frame_height: 192
+  frame_width: 192
+  text_tokenizer_config:
+    text_tokenizer_name: "gemma"
+    text_embedding_shape: [1, 768]
+    text_annotation_model_version: ["gemini-2.5-flash", "gemini-2.5-flash-thinking-0905"]
+  tokenizer:
+    type: "conv"
+    conv_tokenizer_config:
+      num_tokens: 1
+  # 使用 32 位精度，方便在调试/Profiler 里看数值
+  precision: "32-true"
+
+inference:
+  mouse_sampling_approach: "truncated_normal"
+
+# Policy Model Configuration (保持结构，但大幅缩小模型规模方便 debug)
+policy_model:
+  n_transformer_layers: 2
+  n_q_head: 4
+  n_kv_head: 4
+  n_thinking_tokens: 1
+  transformer_dim: &transformer_dim 256
+  mask_block_size: 32
+  attention_history_len: [20, 20]
+  n_kv_sink_tokens: 0
+  model_type: "dense"
+  action_decoder:
+    embed_dim: *transformer_dim
+
+
+stage3_finetune:
+  optim:
+    learning_rate: 0.0003
+    weight_decay: 0.0001
+    beta_1: 0.9
+    beta_2: 0.999
+
+  # 调试：频繁做一点点验证，方便看指标
+  validation_step_interval: 50
+  n_validation_steps: &n_validation_steps 2
+  # 很快出 checkpoint，方便在 Cursor 里加载/对比
+  save_every_n_steps: 50
+  # 调试总步数，几分钟内能跑完
+  n_training_steps: 200
+  accumulate_grad_batches: 1
+
+  training_dataset:
+    # 小 batch，适配显存 + 调试场景
+    batch_size: &stage3_batch_size 1
+    # 默认用 --data_folder 覆盖，这里给一个安全默认值
+    local_prefix: dataset
+    warn_on_starvation: false
+    # 调试时先关掉重 Aug，方便看原始数值是否正常
+    rand_augmentation:
+      fraction_augmented: 0.0
+      augmentations: []
+    # toy 数据/单机调试的轻量参数
+    n_preprocess_threads_per_gpu: 1
+    preprocessed_chunks_queue_size_per_gpu: 1
+    shuffle_buffer_size_per_gpu: 16
+    dataset_worker_num_workers_per_gpu: 1
+    dataset_worker_prefetch_factor: 1
+    shuffled_chunks_queue_size_per_gpu: 1
+
+  validation_datasets:
+    - batch_size: *stage3_batch_size
+      local_prefix: dataset
+      validation_name: "overall"
+      n_preprocess_threads_per_gpu: &validation_stage3_n_preprocess_threads_per_gpu 1
+      preprocessed_chunks_queue_size_per_gpu: &validation_stage3_preprocessed_chunks_size_per_gpu 1
+      shuffled_chunks_queue_size_per_gpu: &validation_stage3_shuffled_chunks_queue_size 1
+      dataset_worker_prefetch_factor: &validation_stage3_dataset_worker_prefetch_factor 1
+      warn_on_starvation: false
+
+
+wandb:
+  enabled: false
+  project: "policy_model"
+  exp_name: "debug-150M-toy"
+
