@@ -755,7 +755,6 @@ class PolicyModelTrainer(ModelFreePolicy):
         effective_mask = self._compute_effective_mask(
             user_action_mask, valid_frame_mask, system_action_mask
         )
-        # effective_mask = user_action_mask & valid_frame_mask
         actions_in = batch.action_annotations
         masked_labels = StructuredAction(
             keys=torch.where(
@@ -783,6 +782,21 @@ class PolicyModelTrainer(ModelFreePolicy):
             (), dtype=torch.float32, device=user_action_mask.device
         )
         return actions_in, masked_labels, ratio_unlabeled
+
+    def _compute_effective_mask(
+        self, user_action_mask, valid_frame_mask, system_action_mask
+    ):
+        """
+        Compute the effective mask of frames to supervise on.
+
+        Default behavior (used by the base Stage3LabelledBCLightning) is:
+        - only frames that are both user-labeled and valid contribute to the loss
+        - system_action_mask is ignored here (no IDM / special handling)
+
+        Subclasses (e.g. Stage3FutureVisionLightning) can override this method
+        to incorporate system_action_mask or other custom logic.
+        """
+        return valid_frame_mask & (user_action_mask)
 
     def _apply_augmentations(self, batch):
         """Apply random augmentations to frames on GPU"""
@@ -977,7 +991,21 @@ class PolicyModelTrainer(ModelFreePolicy):
                 metric.reset()
 
     def configure_optimizers(self):
-        raise NotImplementedError("Not implemented for base class.")
+        """Default fallback: use Stage3 optim config. Subclasses should override."""
+        logging.warning(
+            "PolicyModelTrainer.configure_optimizers() using default AdamW. "
+            "Consider overriding this method in your subclass."
+        )
+        assert not self.inference_mode
+        optim_cfg = self.config.stage3_finetune.optim
+        optimizer = optim.AdamW(
+            self.parameters(),
+            lr=optim_cfg.learning_rate,
+            betas=(optim_cfg.beta_1, optim_cfg.beta_2),
+            weight_decay=optim_cfg.weight_decay,
+            fused=True,
+        )
+        return [optimizer]
 
     def _get_text_embedding_dim(self):
         return self.config.shared.text_tokenizer_config.text_embedding_shape[-1]
@@ -1007,6 +1035,20 @@ class Stage3LabelledBCLightning(PolicyModelTrainer):
     def _get_transformer_mask_fn(self):
         # Use the default, causal mask.
         return None
+
+    def configure_optimizers(self):
+        assert not self.inference_mode
+        optimizer = optim.AdamW(
+            self.parameters(),
+            lr=self.config.stage3_finetune.optim.learning_rate,
+            betas=(
+                self.config.stage3_finetune.optim.beta_1,
+                self.config.stage3_finetune.optim.beta_2,
+            ),
+            weight_decay=self.config.stage3_finetune.optim.weight_decay,
+            fused=True,
+        )
+        return [optimizer]
 
 
 class Stage3FutureVisionLightning(PolicyModelTrainer):

@@ -53,7 +53,8 @@ stage3_finetune:
   accumulate_grad_batches: 1
 
   training_dataset:
-    batch_size: &stage3_batch_size 2  # V-JEPA 2 模型较大，可能需要减小 batch size
+    # V-JEPA 2 模型较大，这里示例使用 batch_size=1 作为保守默认值
+    batch_size: &stage3_batch_size 1
     local_prefix: "dataset"
     warn_on_starvation: false
     always_labelled: true

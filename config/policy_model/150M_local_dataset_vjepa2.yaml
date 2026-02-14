@@ -1,0 +1,138 @@
+shared:
+  # V-JEPA2 版本的输出目录，避免和 conv/dinov2 版本混在一起
+  output_path: output/policy_model/150M_vjepa2
+  n_seq_timesteps: 200
+  frame_height: 192
+  frame_width: 192
+  text_tokenizer_config:
+    text_tokenizer_name: "gemma"
+    text_embedding_shape: [1, 768]
+    text_annotation_model_version: ["gemini-2.5-flash", "gemini-2.5-flash-thinking-0905"]
+  tokenizer:
+    type: "vjepa2"
+    vjepa_tokenizer_config:
+      # V-JEPA2 checkpoint 路径（本地文件）
+      # 如果设置了此路径且文件存在，将从此路径加载模型权重
+      # 如果为 None 或文件不存在，将根据 use_hub_fallback 决定是否从 torch.hub 下载
+      # 示例路径（请根据实际情况修改）：
+      #   Windows: "D:/project/vjepa2/checkpoints/vjepa2_vit_l.pth"
+      #   Linux/WSL: "/mnt/d/project/vjepa2/checkpoints/vjepa2_vit_l.pth"
+      #   或使用环境变量: ${VJEPA2_CHECKPOINT_PATH}
+      checkpoint_path: "/mnt/d/project/vjepa2/jepa_checkpoints/vitl.pt"  # 设置为 null 表示不使用本地 checkpoint
+      
+      # V-JEPA2 模型架构名称
+      # 可选值：
+      #   - "vit_large": ViT-Large 模型（约 300M 参数，embed_dim=1024，推荐）
+      #   - "vit_huge": ViT-Huge 模型（约 600M 参数，embed_dim=1280，需要更多显存）
+      #   - "vit_giant": ViT-Giant 模型（约 1.1B 参数，embed_dim=1408，需要大量显存）
+      #   - "vit_giant_384": ViT-Giant-384 模型（输入尺寸 384x384）
+      model_name: "vit_large"
+      
+      # 是否冻结 V-JEPA2 的参数（不进行梯度更新）
+      # 推荐设置为 true，只训练投影层和 policy transformer，节省显存和计算
+      # 如果设置为 false，将进行端到端微调（需要更多显存和计算资源）
+      frozen: true
+      
+      # V-JEPA2 期望的输入图像尺寸（高度和宽度）
+      # ViT-L/H/g 使用 256x256，vit_giant_384 使用 384x384
+      # 如果实际输入尺寸不同（如 192x192），会自动进行 bilinear 插值 resize
+      img_size: 256
+      
+      # 空间维度的 patch 大小（像素）
+      # V-JEPA2 将图像分割成 patch_size x patch_size 的 patches
+      # 例如：img_size=256, patch_size=16 -> 16x16 = 256 个空间 patches
+      patch_size: 16
+      
+      # 时间维度的 tubelet 大小（帧数）
+      # V-JEPA2 将连续 tubelet_size 帧压缩成一个时间步
+      # 例如：tubelet_size=2 表示每 2 帧压缩成 1 个时间步
+      # 这意味着输入 T 帧，输出 T//tubelet_size 个时间步的特征
+      # 注意：V-JEPA2 要求输入帧数 T >= tubelet_size（通常是 2）
+      # Vjepa2Tokenizer 会自动处理单帧输入（通过帧复制/缓冲）
+      tubelet_size: 2
+      
+      # 预训练时使用的帧数（仅用于模型初始化，不影响实际输入）
+      # V-JEPA2 在预训练时使用 64 帧，但实际使用时可以输入任意帧数
+      # 此参数主要用于正确初始化模型结构
+      num_frames: 64
+      
+      # 当本地 checkpoint 不存在时，是否使用 torch.hub 作为后备方案
+      # 如果设置为 true，将从 torch.hub 下载预训练权重（需要网络连接）
+      # 如果设置为 false，本地 checkpoint 不存在时会抛出错误
+      use_hub_fallback: false
+
+inference:
+  mouse_sampling_approach: "truncated_normal"
+
+# Policy Model Configuration (Stage 2 student & 3 model)
+policy_model:
+  n_transformer_layers: 10
+  n_q_head: 16
+  n_kv_head: 16
+  n_thinking_tokens: 1
+  transformer_dim: &transformer_dim 1024
+  mask_block_size: 128
+  attention_history_len: [200, 200, 200, 200, 200, 200, 200, 200, 200, 200] # the length of the attention history needs to be the same as n_transformer_layers
+  n_kv_sink_tokens: 0
+  model_type: "dense"
+  action_decoder:
+    embed_dim: *transformer_dim
+
+
+stage3_finetune:
+  optim:
+    learning_rate: 0.0001
+    weight_decay: 0.0001
+    beta_1: 0.9
+    beta_2: 0.999
+
+  validation_step_interval: 20000  # 每 20000 步进行一次验证
+  n_validation_steps: &n_validation_steps 200
+  save_every_n_steps: 10000  # 每 10000 步保存一次检查点
+  n_training_steps: 500000  # 训练总步数（可根据数据集大小调整）
+  accumulate_grad_batches: 1
+
+  training_dataset:
+    # ⚠️ V-JEPA2 模型较大，这里固定 batch_size=1 以最大化稳定性（特别是在 32GB 显存下）
+    # 如果后续确认显存充足，可以再尝试调高到 2
+    batch_size: &stage3_batch_size 1  # 批量大小（V-JEPA2 当前设置为 1）
+    local_prefix: "dataset"  # ⭐ 本地数据集路径（相对于项目根目录）
+    warn_on_starvation: false
+    always_labelled: true  # 使用标注数据
+    rand_augmentation:
+      fraction_augmented: 1.0
+      augmentations:
+        - spatial_transform
+        - color
+        - planckian
+        - iso_noise
+        - translation
+        - random_blur
+        - sharpness
+    # 数据加载参数（可根据数据集大小和 GPU 数量调整）
+    # ⚠️ 注意：如果遇到 "No space left on device" 错误，减少这些参数
+    # ⚠️⚠️ 当前已设为最小配置以避免 /dev/shm 空间不足
+    n_preprocess_threads_per_gpu: 1  # 每个 GPU 的预处理线程数（降到 1，单线程最小化共享内存）
+    preprocessed_chunks_queue_size_per_gpu: 16  # 预处理队列大小（降到 16）
+    shuffle_buffer_size_per_gpu: 200  # 打乱缓冲区大小（降到 200）
+    dataset_worker_num_workers_per_gpu: 1  # 每个 GPU 的数据加载工作进程数
+    dataset_worker_prefetch_factor: 2  # 数据预取因子
+    shuffled_chunks_queue_size_per_gpu: 2  # 打乱后的队列大小
+
+  validation_datasets:
+    - batch_size: *stage3_batch_size
+      local_prefix: "dataset"  # ⭐ 与训练集一致的本地路径
+      validation_name: "overall"
+      n_preprocess_threads_per_gpu: &validation_stage3_n_preprocess_threads_per_gpu 8
+      preprocessed_chunks_queue_size_per_gpu: &validation_stage3_preprocessed_chunks_queue_size_per_gpu 1
+      shuffled_chunks_queue_size_per_gpu: &validation_stage3_shuffled_chunks_queue_size 1
+      dataset_worker_prefetch_factor: &validation_stage3_dataset_worker_prefetch_factor 8
+      warn_on_starvation: false
+      always_labelled: true
+
+
+wandb:
+  enabled: True  # 启用 WandB 日志
+  entity: "zjut-cv"  # WandB组织/用户名（你登录的组织）
+  project: "policy_model"
+  exp_name: "150M-local-dataset-vjepa2"  # 实验名称（与 conv/dinov2 版本区分）

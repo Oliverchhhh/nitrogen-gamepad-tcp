@@ -516,12 +516,20 @@ class Vjepa2Tokenizer(ImageBaseTokenizer):
         if H != self.vjepa_config.img_size or W != self.vjepa_config.img_size:
             # 使用 bilinear 插值进行 resize
             # 先将 (B, C, T, H, W) reshape 成 (B*C, T, H, W) 以便使用 F.interpolate
+            # 注意：x 在经过 permute 之后不再保证内存连续，这里使用 reshape 而不是 view，
+            # 以避免 stride 不兼容导致的 RuntimeError。
             x = F.interpolate(
-                x.view(B * C, T_padded, H, W),
+                x.reshape(B * C, T_padded, H, W),
                 size=(self.vjepa_config.img_size, self.vjepa_config.img_size),
                 mode="bilinear",
                 align_corners=False,
-            ).view(B, C, T_padded, self.vjepa_config.img_size, self.vjepa_config.img_size)
+            ).reshape(
+                B,
+                C,
+                T_padded,
+                self.vjepa_config.img_size,
+                self.vjepa_config.img_size,
+            )
         
         # ========================================================================
         # 步骤 4: 调用 V-JEPA 2 encoder
