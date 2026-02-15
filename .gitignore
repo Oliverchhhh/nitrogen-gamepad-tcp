@@ -45,3 +45,4 @@ batch_*.tar.gz
 # 排除所有分析文档（AI对话生成的md文件）
 *.md
 !README.md
+!README_STAGE3_FUTURE_VISION.md
