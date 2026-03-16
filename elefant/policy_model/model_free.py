@@ -1,5 +1,8 @@
 import lightning as pl
-from elefant.data.action_mapping import UniversalAutoregressiveActionMapping
+from elefant.data.action_mapping import (
+    UniversalAutoregressiveActionMapping,
+    GamepadAutoregressiveActionMapping,
+)
 from elefant.policy_model.config import LightningPolicyConfig
 from elefant.im_tokenizer.config import ImageTokenizerConfig
 from elefant.policy_model.policy_transformer import (
@@ -29,9 +32,14 @@ class ModelFreePolicy(pl.LightningModule):
         super().__init__()
         self.config = config
         self.inference_mode = inference_mode
-        self.action_mapping = UniversalAutoregressiveActionMapping(
-            config=self.config.shared.action_mapping
-        )
+        if getattr(self.config.shared, "action_mapping_type", "keyboard_mouse") == "gamepad":
+            self.action_mapping = GamepadAutoregressiveActionMapping(
+                config=self.config.shared.gamepad_action_mapping
+            )
+        else:
+            self.action_mapping = UniversalAutoregressiveActionMapping(
+                config=self.config.shared.action_mapping
+            )
 
         # for stage2 and stage3 policy model, the model attend to real actions
         self.transformer_n_action_tokens = self.action_mapping.get_seq_len()

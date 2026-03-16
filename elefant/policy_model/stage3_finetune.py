@@ -12,6 +12,7 @@ from elefant.data import (
     ActionLabelVideoProtoDataset,
     ActionLabelVideoProtoDatasetConfig,
     UniversalAutoregressiveActionMapping,
+    GamepadAutoregressiveActionMapping,
     DummyDataset,
     DummyDatasetConfig,
     StructuredAction,
@@ -23,7 +24,7 @@ from elefant.policy_model.model_free import ModelFreePolicy
 from lightning.pytorch.callbacks import ModelCheckpoint
 from elefant.lightning import AsyncCheckpointIO
 from lightning.pytorch.utilities import grad_norm
-from typing import List, Optional
+from typing import List, Optional, NamedTuple
 from elefant.torch import ELEFANT_WANDB_DIR
 from elefant.policy_model.kv_cache import KVCacheState
 import pydantic_yaml
@@ -47,9 +48,7 @@ def upload_model_config(checkpoint_path: str, config):
         f.write(pydantic_yaml.to_yaml_str(config).encode())
 
 
-def upload_action_mapping(
-    checkpoint_path: str, action_mapping: UniversalAutoregressiveActionMapping
-):
+def upload_action_mapping(checkpoint_path: str, action_mapping):
     """Upload the action mapping to the checkpoint path."""
     logging.info(f"Uploading action mapping to {checkpoint_path}/action_mapping.json")
     with fsspec.open(checkpoint_path + "/action_mapping.json", "w") as f:
@@ -65,6 +64,16 @@ def _sample_from_distribution(
     cdf = torch.cumsum(probs, dim=-1)
     cmp = cdf >= unif_rand.unsqueeze(-1)
     return cmp.float().argmax(dim=-1)
+
+
+class GamepadActionLogits(NamedTuple):
+    buttons: torch.Tensor
+    left_stick_x: torch.Tensor
+    left_stick_y: torch.Tensor
+    right_stick_x: torch.Tensor
+    right_stick_y: torch.Tensor
+    left_trigger: torch.Tensor
+    right_trigger: torch.Tensor
 
 
 class PolicyModelTrainer(ModelFreePolicy):
@@ -200,12 +209,66 @@ class PolicyModelTrainer(ModelFreePolicy):
 
         return last_action_in_token
 
+    def _gamepad_action_sampler(
+        self,
+        action_token: torch.Tensor,
+        action_idx: int,
+        sampled_actions: torch.Tensor,
+        sampling_temperature: float = 1.0,
+        unif_rand: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        T = action_token.shape[0]
+        embed_dim = self.config.policy_model.action_decoder.embed_dim
+        eager_assert(action_token.shape, (T, 1, embed_dim))
+
+        if action_idx < self.n_gamepad_button_actions:
+            action_logits = self.gamepad_button_out_logits(action_token)
+            n_choices = self.n_gamepad_button_choices
+        elif action_idx < self.n_gamepad_button_actions + 4:
+            action_logits = self.gamepad_stick_out_logits(action_token)
+            n_choices = self.n_gamepad_stick_bins
+        else:
+            action_logits = self.gamepad_trigger_out_logits(action_token)
+            n_choices = self.n_gamepad_trigger_bins
+
+        eager_assert(action_logits.shape, (T, 1, n_choices))
+        action = _sample_from_logits_gpu(
+            action_logits,
+            sampling_temperature,
+            None if unif_rand is None else unif_rand[action_idx],
+            top_p=self.top_p,
+        ).squeeze(1)
+        eager_assert(action.shape, (T, 1))
+
+        sampled_actions[:, action_idx] = action.squeeze(1)
+
+        if action_idx < self.n_gamepad_button_actions:
+            last_action_in_token = self.gamepad_button_embedding(action)
+        elif action_idx < self.n_gamepad_button_actions + 4:
+            last_action_in_token = self.gamepad_stick_embedding(action)
+        else:
+            last_action_in_token = self.gamepad_trigger_embedding(action)
+
+        eager_assert(last_action_in_token.shape, (T, 1, embed_dim))
+        return last_action_in_token
+
     def on_validation_epoch_start(self):
         # done this way since val_dataloaders are not initialized in _init_ so can't get
         # keys from it(i.e. val_set_names)
         if not self._validation_metrics and self.trainer.val_dataloaders:
             val_set_names = list(self.trainer.val_dataloaders.keys())
-            action_types = list(StructuredAction._fields)
+            if self._use_gamepad_mapping():
+                action_types = [
+                    "gamepad_button",
+                    "left_stick_x",
+                    "left_stick_y",
+                    "right_stick_x",
+                    "right_stick_y",
+                    "left_trigger",
+                    "right_trigger",
+                ]
+            else:
+                action_types = list(StructuredAction._fields)
 
             for val_set_name in val_set_names:
                 metrics = {
@@ -221,8 +284,22 @@ class PolicyModelTrainer(ModelFreePolicy):
 
                 self._validation_metrics[val_set_name] = metrics
 
+    def _use_gamepad_mapping(self) -> bool:
+        return isinstance(self.action_mapping, GamepadAutoregressiveActionMapping)
+
     def _init_metrics(self):
-        action_types = list(StructuredAction._fields)
+        if self._use_gamepad_mapping():
+            action_types = [
+                "gamepad_button",
+                "left_stick_x",
+                "left_stick_y",
+                "right_stick_x",
+                "right_stick_y",
+                "left_trigger",
+                "right_trigger",
+            ]
+        else:
+            action_types = list(StructuredAction._fields)
         self.action_type_to_metric_name = {}
         # mapping from field names to metric names
         for field_name in action_types:
@@ -231,7 +308,6 @@ class PolicyModelTrainer(ModelFreePolicy):
             elif field_name == "mouse_buttons":
                 self.action_type_to_metric_name[field_name] = "mouse_button"
             else:
-                # for mouse_delta_x and mouse_delta_y, keep the same name
                 self.action_type_to_metric_name[field_name] = field_name
 
         self._training_loss_metric = LossMetric()
@@ -257,6 +333,51 @@ class PolicyModelTrainer(ModelFreePolicy):
         self.n_actions = self.action_mapping.get_seq_len()
 
         self.embedding_std = 0.1
+        embed_dim = self.config.policy_model.action_decoder.embed_dim
+
+        if self._use_gamepad_mapping():
+            self.n_gamepad_button_actions = self.action_mapping.get_number_of_button_actions()
+            self.n_gamepad_button_choices = self.action_mapping.get_number_of_button_choices()
+            self.n_gamepad_stick_bins = self.action_mapping.get_n_stick_bins()
+            self.n_gamepad_trigger_bins = self.action_mapping.get_n_trigger_bins()
+
+            self.gamepad_button_embedding = nn.Embedding(
+                num_embeddings=self.n_gamepad_button_choices,
+                embedding_dim=embed_dim,
+                dtype=torch.bfloat16,
+            )
+            torch.nn.init.normal_(
+                self.gamepad_button_embedding.weight, mean=0.0, std=self.embedding_std
+            )
+
+            self.gamepad_stick_embedding = nn.Embedding(
+                num_embeddings=self.n_gamepad_stick_bins,
+                embedding_dim=embed_dim,
+                dtype=torch.bfloat16,
+            )
+            torch.nn.init.normal_(
+                self.gamepad_stick_embedding.weight, mean=0.0, std=self.embedding_std
+            )
+
+            self.gamepad_trigger_embedding = nn.Embedding(
+                num_embeddings=self.n_gamepad_trigger_bins,
+                embedding_dim=embed_dim,
+                dtype=torch.bfloat16,
+            )
+            torch.nn.init.normal_(
+                self.gamepad_trigger_embedding.weight, mean=0.0, std=self.embedding_std
+            )
+
+            self.gamepad_button_out_logits = nn.Linear(
+                embed_dim, self.n_gamepad_button_choices
+            )
+            self.gamepad_stick_out_logits = nn.Linear(
+                embed_dim, self.n_gamepad_stick_bins
+            )
+            self.gamepad_trigger_out_logits = nn.Linear(
+                embed_dim, self.n_gamepad_trigger_bins
+            )
+            return
 
         # Keyboard actions
         self.n_keyboard_actions = self.action_mapping.get_number_of_keyboard_actions()
@@ -344,8 +465,16 @@ class PolicyModelTrainer(ModelFreePolicy):
         def _action_sampler(
             action_token: torch.Tensor,
             action_idx: int,
-            sampled_actions: StructuredAction,
+            sampled_actions,
         ) -> torch.Tensor:
+            if self._use_gamepad_mapping():
+                return self._gamepad_action_sampler(
+                    action_token,
+                    action_idx,
+                    sampled_actions,
+                    sampling_temperature,
+                    unif_rand,
+                )
             return self._keyboard_mouse_action_sampler(
                 action_token,
                 action_idx,
@@ -389,9 +518,9 @@ class PolicyModelTrainer(ModelFreePolicy):
     def online_full_predict_logits(
         self,
         frames: torch.Tensor,
-        actions: torch.Tensor,
+        actions,
         text_tokens_embed: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+    ):
         frames = self._normalize_frames(frames)
         B, T = frames.shape[0], frames.shape[1]
         action_in = self.action_in_to_tokens(actions)
@@ -399,31 +528,86 @@ class PolicyModelTrainer(ModelFreePolicy):
             frames, action_in, text_tokens_embed
         )
         action_logits = self.action_out_tokens_to_logits(action_out)
-        eager_assert(
-            action_logits.keys.shape,
-            (
-                B,
-                T,
-                self.n_keyboard_actions,
-                self.n_keyboard_choices,
-            ),
-        )
+        if self._use_gamepad_mapping():
+            eager_assert(
+                action_logits.buttons.shape,
+                (B, T, self.n_gamepad_button_actions, self.n_gamepad_button_choices),
+            )
+        else:
+            eager_assert(
+                action_logits.keys.shape,
+                (
+                    B,
+                    T,
+                    self.n_keyboard_actions,
+                    self.n_keyboard_choices,
+                ),
+            )
         return action_logits
 
     def online_full_predict(
         self,
         frames: torch.Tensor,
-        actions: torch.Tensor,
+        actions,
         kv_cache_state: List[KVCacheState] = None,
         sampling_temperature: float = 1.0,
         text_tokens_embed: Optional[str] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ):
         @(torch.compile(fullgraph=True) if compile else lambda f: f)
         def _predict(frames, actions, kv_cache_state, text_tokens_embed):
             T = frames.shape[1]
             action_logits = self.online_full_predict_logits(
                 frames, actions, text_tokens_embed
             )
+
+            if self._use_gamepad_mapping():
+                button_idx = _sample_from_logits_gpu(
+                    action_logits.buttons,
+                    sampling_temperature,
+                    None,
+                    top_p=self.top_p,
+                ).squeeze(-1)
+                lx_idx = _sample_from_logits_gpu(
+                    action_logits.left_stick_x,
+                    sampling_temperature,
+                    None,
+                    top_p=self.top_p,
+                ).squeeze(-1)
+                ly_idx = _sample_from_logits_gpu(
+                    action_logits.left_stick_y,
+                    sampling_temperature,
+                    None,
+                    top_p=self.top_p,
+                ).squeeze(-1)
+                rx_idx = _sample_from_logits_gpu(
+                    action_logits.right_stick_x,
+                    sampling_temperature,
+                    None,
+                    top_p=self.top_p,
+                ).squeeze(-1)
+                ry_idx = _sample_from_logits_gpu(
+                    action_logits.right_stick_y,
+                    sampling_temperature,
+                    None,
+                    top_p=self.top_p,
+                ).squeeze(-1)
+                lt_idx = _sample_from_logits_gpu(
+                    action_logits.left_trigger,
+                    sampling_temperature,
+                    None,
+                    top_p=self.top_p,
+                ).squeeze(-1)
+                rt_idx = _sample_from_logits_gpu(
+                    action_logits.right_trigger,
+                    sampling_temperature,
+                    None,
+                    top_p=self.top_p,
+                ).squeeze(-1)
+                action_out = torch.cat(
+                    [button_idx, lx_idx, ly_idx, rx_idx, ry_idx, lt_idx, rt_idx], dim=-1
+                )
+                eager_assert(action_out.shape, (1, T, self.n_actions))
+                return action_out, action_logits
 
             key_idx = _sample_from_logits_gpu(
                 action_logits.keys,
@@ -467,12 +651,45 @@ class PolicyModelTrainer(ModelFreePolicy):
             return _predict(frames, actions, kv_cache_state, text_tokens_embed)
 
     def action_in_to_tokens(
-        self, action_in: StructuredAction, idx: Optional[torch.Tensor] = None
+        self, action_in, idx: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
         If idx is provided, this will return dummy actions that match the shape of the frame input.
         If idx is not provided, this will return the actual actions embeddings.
         """
+        if self._use_gamepad_mapping():
+            B, T, N = action_in.shape
+            eager_assert(N, self.n_actions)
+            if idx is None:
+                idx = torch.arange(B)
+            selected_actions = action_in[idx]
+            button_tokens = selected_actions[:, :, : self.n_gamepad_button_actions]
+            axis_tokens = selected_actions[:, :, self.n_gamepad_button_actions :]
+            eager_assert(axis_tokens.shape, (len(idx), T, 6))
+
+            action_embedding = torch.cat(
+                [
+                    self.gamepad_button_embedding(button_tokens),
+                    self.gamepad_stick_embedding(axis_tokens[:, :, 0:1]),
+                    self.gamepad_stick_embedding(axis_tokens[:, :, 1:2]),
+                    self.gamepad_stick_embedding(axis_tokens[:, :, 2:3]),
+                    self.gamepad_stick_embedding(axis_tokens[:, :, 3:4]),
+                    self.gamepad_trigger_embedding(axis_tokens[:, :, 4:5]),
+                    self.gamepad_trigger_embedding(axis_tokens[:, :, 5:6]),
+                ],
+                dim=2,
+            )
+            eager_assert(
+                action_embedding.shape,
+                (
+                    len(idx),
+                    T,
+                    self.n_actions,
+                    self.config.policy_model.action_decoder.embed_dim,
+                ),
+            )
+            return action_embedding
+
         B, T, _ = action_in.keys.shape
         eager_assert(action_in.keys.shape, (B, T, self.n_keyboard_actions))
         eager_assert(action_in.mouse_buttons.shape, (B, T, self.n_mouse_button_actions))
@@ -503,7 +720,7 @@ class PolicyModelTrainer(ModelFreePolicy):
         eager_assert(
             action_embedding.shape,
             (
-                B if idx is None else len(idx),
+                len(idx),
                 T,
                 self.n_actions,
                 self.config.policy_model.action_decoder.embed_dim,
@@ -513,11 +730,46 @@ class PolicyModelTrainer(ModelFreePolicy):
 
     def action_out_tokens_to_logits(
         self, action_out_tokens: torch.Tensor
-    ) -> torch.Tensor:
+    ):
         # Any changes here should be reflected in the online_kv_cache_predict function.
 
         B, T, N, D = action_out_tokens.shape
         eager_assert(N, self.n_actions)
+
+        if self._use_gamepad_mapping():
+            k = self.n_gamepad_button_actions
+            button_logits = self.gamepad_button_out_logits(action_out_tokens[:, :, :k, :])
+            eager_assert(
+                button_logits.shape,
+                (B, T, k, self.n_gamepad_button_choices),
+            )
+            left_stick_x_logits = self.gamepad_stick_out_logits(
+                action_out_tokens[:, :, k : k + 1, :]
+            )
+            left_stick_y_logits = self.gamepad_stick_out_logits(
+                action_out_tokens[:, :, k + 1 : k + 2, :]
+            )
+            right_stick_x_logits = self.gamepad_stick_out_logits(
+                action_out_tokens[:, :, k + 2 : k + 3, :]
+            )
+            right_stick_y_logits = self.gamepad_stick_out_logits(
+                action_out_tokens[:, :, k + 3 : k + 4, :]
+            )
+            left_trigger_logits = self.gamepad_trigger_out_logits(
+                action_out_tokens[:, :, k + 4 : k + 5, :]
+            )
+            right_trigger_logits = self.gamepad_trigger_out_logits(
+                action_out_tokens[:, :, k + 5 : k + 6, :]
+            )
+            return GamepadActionLogits(
+                buttons=button_logits,
+                left_stick_x=left_stick_x_logits,
+                left_stick_y=left_stick_y_logits,
+                right_stick_x=right_stick_x_logits,
+                right_stick_y=right_stick_y_logits,
+                left_trigger=left_trigger_logits,
+                right_trigger=right_trigger_logits,
+            )
 
         key_logits = self.keyboard_out_logits(
             action_out_tokens[:, :, : self.n_keyboard_actions, :]
@@ -595,6 +847,74 @@ class PolicyModelTrainer(ModelFreePolicy):
         super().copy_weights(stage2_model)
 
     def _calculate_z_loss(self, action_logits, masked_labels):
+        if self._use_gamepad_mapping():
+            k = self.n_gamepad_button_actions
+            gamepad_button_z_loss = (
+                (
+                    action_logits.buttons.view(-1, self.n_gamepad_button_choices)
+                    .logsumexp(-1)
+                    .pow(2)
+                )
+                * (masked_labels[:, :, :k].reshape(-1) != -100)
+            ).mean()
+            left_stick_x_z_loss = (
+                (
+                    action_logits.left_stick_x.view(-1, self.n_gamepad_stick_bins)
+                    .logsumexp(-1)
+                    .pow(2)
+                )
+                * (masked_labels[:, :, k : k + 1].reshape(-1) != -100)
+            ).mean()
+            left_stick_y_z_loss = (
+                (
+                    action_logits.left_stick_y.view(-1, self.n_gamepad_stick_bins)
+                    .logsumexp(-1)
+                    .pow(2)
+                )
+                * (masked_labels[:, :, k + 1 : k + 2].reshape(-1) != -100)
+            ).mean()
+            right_stick_x_z_loss = (
+                (
+                    action_logits.right_stick_x.view(-1, self.n_gamepad_stick_bins)
+                    .logsumexp(-1)
+                    .pow(2)
+                )
+                * (masked_labels[:, :, k + 2 : k + 3].reshape(-1) != -100)
+            ).mean()
+            right_stick_y_z_loss = (
+                (
+                    action_logits.right_stick_y.view(-1, self.n_gamepad_stick_bins)
+                    .logsumexp(-1)
+                    .pow(2)
+                )
+                * (masked_labels[:, :, k + 3 : k + 4].reshape(-1) != -100)
+            ).mean()
+            left_trigger_z_loss = (
+                (
+                    action_logits.left_trigger.view(-1, self.n_gamepad_trigger_bins)
+                    .logsumexp(-1)
+                    .pow(2)
+                )
+                * (masked_labels[:, :, k + 4 : k + 5].reshape(-1) != -100)
+            ).mean()
+            right_trigger_z_loss = (
+                (
+                    action_logits.right_trigger.view(-1, self.n_gamepad_trigger_bins)
+                    .logsumexp(-1)
+                    .pow(2)
+                )
+                * (masked_labels[:, :, k + 5 : k + 6].reshape(-1) != -100)
+            ).mean()
+            return (
+                gamepad_button_z_loss,
+                left_stick_x_z_loss,
+                left_stick_y_z_loss,
+                right_stick_x_z_loss,
+                right_stick_y_z_loss,
+                left_trigger_z_loss,
+                right_trigger_z_loss,
+            )
+
         key_z_loss = (
             (action_logits.keys.view(-1, self.n_keyboard_choices).logsumexp(-1).pow(2))
             * (masked_labels.keys.view(-1) != -100)
@@ -666,6 +986,96 @@ class PolicyModelTrainer(ModelFreePolicy):
         )
 
         action_logits = self.action_out_tokens_to_logits(action_out_embeddings)
+
+        if self._use_gamepad_mapping():
+            k = self.n_gamepad_button_actions
+            gamepad_button_loss = F.cross_entropy(
+                input=action_logits.buttons.view(-1, self.n_gamepad_button_choices),
+                target=masked_labels[:, :, :k].reshape(-1),
+                ignore_index=-100,
+            )
+            left_stick_x_loss = F.cross_entropy(
+                input=action_logits.left_stick_x.view(-1, self.n_gamepad_stick_bins),
+                target=masked_labels[:, :, k : k + 1].reshape(-1),
+                ignore_index=-100,
+            )
+            left_stick_y_loss = F.cross_entropy(
+                input=action_logits.left_stick_y.view(-1, self.n_gamepad_stick_bins),
+                target=masked_labels[:, :, k + 1 : k + 2].reshape(-1),
+                ignore_index=-100,
+            )
+            right_stick_x_loss = F.cross_entropy(
+                input=action_logits.right_stick_x.view(-1, self.n_gamepad_stick_bins),
+                target=masked_labels[:, :, k + 2 : k + 3].reshape(-1),
+                ignore_index=-100,
+            )
+            right_stick_y_loss = F.cross_entropy(
+                input=action_logits.right_stick_y.view(-1, self.n_gamepad_stick_bins),
+                target=masked_labels[:, :, k + 3 : k + 4].reshape(-1),
+                ignore_index=-100,
+            )
+            left_trigger_loss = F.cross_entropy(
+                input=action_logits.left_trigger.view(-1, self.n_gamepad_trigger_bins),
+                target=masked_labels[:, :, k + 4 : k + 5].reshape(-1),
+                ignore_index=-100,
+            )
+            right_trigger_loss = F.cross_entropy(
+                input=action_logits.right_trigger.view(-1, self.n_gamepad_trigger_bins),
+                target=masked_labels[:, :, k + 5 : k + 6].reshape(-1),
+                ignore_index=-100,
+            )
+
+            lb_loss = auxiliary_losses.get("lb_loss", torch.tensor(0.0))
+            rz_loss = auxiliary_losses.get("rz_loss", torch.tensor(0.0))
+            losses = {
+                "gamepad_button": gamepad_button_loss,
+                "left_stick_x": left_stick_x_loss,
+                "left_stick_y": left_stick_y_loss,
+                "right_stick_x": right_stick_x_loss,
+                "right_stick_y": right_stick_y_loss,
+                "left_trigger": left_trigger_loss,
+                "right_trigger": right_trigger_loss,
+                "lb_loss": lb_loss,
+                "rz_loss": rz_loss,
+            }
+            (
+                gamepad_button_z_loss,
+                left_stick_x_z_loss,
+                left_stick_y_z_loss,
+                right_stick_x_z_loss,
+                right_stick_y_z_loss,
+                left_trigger_z_loss,
+                right_trigger_z_loss,
+            ) = self._calculate_z_loss(action_logits, masked_labels)
+
+            denom_btn = torch.log(torch.tensor(self.n_gamepad_button_choices))
+            denom_stick = torch.log(torch.tensor(self.n_gamepad_stick_bins))
+            denom_trigger = torch.log(torch.tensor(self.n_gamepad_trigger_bins))
+            cross_entropy_loss = (
+                gamepad_button_loss / denom_btn
+                + left_stick_x_loss / denom_stick
+                + left_stick_y_loss / denom_stick
+                + right_stick_x_loss / denom_stick
+                + right_stick_y_loss / denom_stick
+                + left_trigger_loss / denom_trigger
+                + right_trigger_loss / denom_trigger
+            )
+            loss = (
+                cross_entropy_loss
+                + (
+                    gamepad_button_z_loss
+                    + left_stick_x_z_loss
+                    + left_stick_y_z_loss
+                    + right_stick_x_z_loss
+                    + right_stick_y_z_loss
+                    + left_trigger_z_loss
+                    + right_trigger_z_loss
+                )
+                * self.z_loss_weight
+                + lb_loss * self.lb_loss_weight
+                + rz_loss * self.rz_loss_weight
+            )
+            return loss, cross_entropy_loss, losses, auxiliary_outputs
 
         eager_assert(
             action_logits.keys.shape,
@@ -756,6 +1166,17 @@ class PolicyModelTrainer(ModelFreePolicy):
             user_action_mask, valid_frame_mask, system_action_mask
         )
         actions_in = batch.action_annotations
+        if self._use_gamepad_mapping():
+            masked_labels = torch.where(
+                effective_mask.unsqueeze(2),
+                batch.action_annotations,
+                -100,
+            )
+            ratio_unlabeled = torch.zeros(
+                (), dtype=torch.float32, device=user_action_mask.device
+            )
+            return actions_in, masked_labels, ratio_unlabeled
+
         masked_labels = StructuredAction(
             keys=torch.where(
                 effective_mask.unsqueeze(2),
@@ -1531,6 +1952,8 @@ class SupervisedDataModule(pl.LightningDataModule):
                 preprocessed_chunks_queue_size=self.training_dataset_cfg.preprocessed_chunks_queue_size_per_gpu,
                 warn_on_starvation=self.training_dataset_cfg.warn_on_starvation,
                 action_mapping=self.cfg.shared.action_mapping,
+                action_mapping_type=self.cfg.shared.action_mapping_type,
+                gamepad_action_mapping=self.cfg.shared.gamepad_action_mapping,
                 always_labelled=self.training_dataset_cfg.always_labelled,
                 rand_augmentation=self.training_dataset_cfg.rand_augmentation,
                 drop_chunks_with_only_system_actions=self._should_drop_chunks_with_only_system_actions(),
@@ -1605,6 +2028,8 @@ class SupervisedDataModule(pl.LightningDataModule):
                     drop_chunks_with_only_system_actions=self._should_drop_chunks_with_only_system_actions(),
                     warn_on_starvation=validation_dataset_cfg.warn_on_starvation,
                     action_mapping=self.cfg.shared.action_mapping,
+                    action_mapping_type=self.cfg.shared.action_mapping_type,
+                    gamepad_action_mapping=self.cfg.shared.gamepad_action_mapping,
                     always_labelled=validation_dataset_cfg.always_labelled,
                     rand_augmentation=validation_dataset_cfg.rand_augmentation,
                     ignore_iterator_reset=True,
@@ -1632,9 +2057,11 @@ class SupervisedDataModule(pl.LightningDataModule):
         return self._val_dataloaders
 
     def get_action_mapping(self):
-        return UniversalAutoregressiveActionMapping(
-            config=self.cfg.shared.action_mapping
-        )
+        if self.cfg.shared.action_mapping_type == "gamepad":
+            return GamepadAutoregressiveActionMapping(
+                config=self.cfg.shared.gamepad_action_mapping
+            )
+        return UniversalAutoregressiveActionMapping(config=self.cfg.shared.action_mapping)
 
 
 class Stage3DataModule(SupervisedDataModule):

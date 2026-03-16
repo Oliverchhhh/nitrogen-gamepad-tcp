@@ -21,7 +21,9 @@ from elefant.text_tokenizer.factory import get_text_tokenizer
 from elefant.text_tokenizer.config import TextTokenizerConfig
 from elefant.data.action_mapping import (
     UniversalAutoregressiveActionMapping,
+    GamepadAutoregressiveActionMapping,
     StructuredAction,
+    DecodedGamepadAction,
 )
 import elefant.data.proto.video_inference_pb2 as video_inference_pb2
 from elefant.policy_model.stage3_finetune import (
@@ -160,7 +162,9 @@ class BaseInferenceState(abc.ABC):
         self.config = config
 
     @abc.abstractmethod
-    def get_action(self, frame: torch.Tensor, text: Optional[str] = None) -> List[str]:
+    def get_action(
+        self, frame: torch.Tensor, text: Optional[str] = None
+    ) -> StructuredAction | DecodedGamepadAction:
         """Get the action for the given frame."""
         pass
 
@@ -179,7 +183,8 @@ class KVCacheInferenceState(BaseInferenceState):
     def __init__(
         self,
         config: LightningPolicyConfig,
-        action_mapping: UniversalAutoregressiveActionMapping,
+        action_mapping: UniversalAutoregressiveActionMapping
+        | GamepadAutoregressiveActionMapping,
         model: Stage3LabelledBCLightning,
         max_virtual_steps: int = 20 * 60 * 60,
         use_manual_sampling: bool = False,
@@ -242,7 +247,7 @@ class KVCacheInferenceState(BaseInferenceState):
 
     def get_action(
         self, frame: torch.Tensor, text: Optional[str] = None
-    ) -> StructuredAction:
+    ) -> StructuredAction | DecodedGamepadAction:
         with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16):
             unif_rand_in = None
             if self.use_manual_sampling:
@@ -572,10 +577,21 @@ class InferenceServer(UnixDomainSocketInferenceServer):
             self._compile_stance = "fail_on_recompile"
 
         self.config = config
-        # TODO: for now action mapping is hardcoded
-        self.action_mapping = UniversalAutoregressiveActionMapping(
-            config=config.shared.action_mapping
-        )
+        mapping_type = getattr(self.config.shared, "action_mapping_type", "keyboard_mouse")
+        if mapping_type == "gamepad":
+            self.action_mapping = GamepadAutoregressiveActionMapping(
+                config=self.config.shared.gamepad_action_mapping
+            )
+            if use_full_inference:
+                raise ValueError(
+                    "Full inference mode currently only supports keyboard_mouse mapping."
+                )
+            logging.info("Using gamepad action mapping for inference.")
+        else:
+            self.action_mapping = UniversalAutoregressiveActionMapping(
+                config=config.shared.action_mapping
+            )
+            logging.info("Using keyboard_mouse action mapping for inference.")
         self.server_port = port
         # Initialize timing metrics
         self.timing_metrics = TimingMetrics(window_seconds=metrics_window_seconds)
@@ -779,17 +795,42 @@ class InferenceServer(UnixDomainSocketInferenceServer):
                             f"Sending keys: {action}, fps: {fps}, time to process frame: {time_to_process_frame}s"
                         )
                         time_since_last_frame_ns = time.time_ns()
-                        mouse = video_inference_pb2.MouseAction(
-                            buttons_down=action.mouse_buttons,
-                            mouse_delta_px=shared_pb2.Vec2Int(
-                                x=int(action.mouse_delta_x), y=int(action.mouse_delta_y)
-                            ),
-                        )
+                        if isinstance(action, DecodedGamepadAction):
+                            # Transport protocol currently has no native gamepad field.
+                            # Encode decoded gamepad semantics into keys with a prefix.
+                            encoded_keys = [
+                                f"gamepad:{btn}" for btn in action.buttons_down
+                            ]
+                            encoded_keys.extend(
+                                [
+                                    f"gamepad:lx={action.left_stick[0]:.4f}",
+                                    f"gamepad:ly={action.left_stick[1]:.4f}",
+                                    f"gamepad:rx={action.right_stick[0]:.4f}",
+                                    f"gamepad:ry={action.right_stick[1]:.4f}",
+                                    f"gamepad:lt={action.left_trigger:.4f}",
+                                    f"gamepad:rt={action.right_trigger:.4f}",
+                                ]
+                            )
+                            mouse = video_inference_pb2.MouseAction(
+                                buttons_down=[],
+                                mouse_delta_px=shared_pb2.Vec2Int(x=0, y=0),
+                            )
+                            response_action = video_inference_pb2.Action(
+                                keys=encoded_keys, id=frame_id, mouse_action=mouse
+                            )
+                        else:
+                            mouse = video_inference_pb2.MouseAction(
+                                buttons_down=action.mouse_buttons,
+                                mouse_delta_px=shared_pb2.Vec2Int(
+                                    x=int(action.mouse_delta_x), y=int(action.mouse_delta_y)
+                                ),
+                            )
+                            response_action = video_inference_pb2.Action(
+                                keys=action.keys, id=frame_id, mouse_action=mouse
+                            )
                         out_callback(
                             (
-                                video_inference_pb2.Action(
-                                    keys=action.keys, id=frame_id, mouse_action=mouse
-                                ),
+                                response_action,
                                 request_start_time,
                             )
                         )

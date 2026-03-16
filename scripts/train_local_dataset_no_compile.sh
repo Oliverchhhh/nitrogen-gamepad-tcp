@@ -1,5 +1,5 @@
 #!/bin/bash
-# 使用本地 dataset 目录训练模型的脚本
+# 使用本地 dataset 目录训练模型的脚本（禁用 torch.compile）
 
 set -e  # 遇到错误立即退出
 
@@ -16,7 +16,7 @@ RED='\033[0;31m'
 NC='\033[0m' # No Color
 
 usage() {
-    echo "用法: bash scripts/train_local_dataset.sh [-d 数据集路径] [-o 输出目录] [-c 配置文件]"
+    echo "用法: bash scripts/train_local_dataset_no_compile.sh [-d 数据集路径] [-o 输出目录] [-c 配置文件]"
     echo
     echo "参数:"
     echo "  -d    数据集路径 (默认: dataset)"
@@ -25,9 +25,9 @@ usage() {
     echo "  -h    显示帮助"
     echo
     echo "示例:"
-    echo "  bash scripts/train_local_dataset.sh"
-    echo "  bash scripts/train_local_dataset.sh -d dataset_toy"
-    echo "  bash scripts/train_local_dataset.sh -d dataset -o ./output_20260316"
+    echo "  bash scripts/train_local_dataset_no_compile.sh"
+    echo "  bash scripts/train_local_dataset_no_compile.sh -d dataset_toy"
+    echo "  bash scripts/train_local_dataset_no_compile.sh -d dataset -o ./output_20260316"
 }
 
 while getopts ":d:o:c:h" opt; do
@@ -61,7 +61,7 @@ cleanup() {
 trap cleanup EXIT
 
 echo -e "${GREEN}========================================${NC}"
-echo -e "${GREEN}Open P2P 本地数据集训练脚本${NC}"
+echo -e "${GREEN}Open P2P 本地数据集训练脚本（no_compile）${NC}"
 echo -e "${GREEN}========================================${NC}"
 
 # 1. 检查数据集路径
@@ -136,12 +136,9 @@ echo -e "\n${YELLOW}[4/5] 设置环境变量和检查共享内存...${NC}"
 # 如果设置了 HF 镜像，取消设置（避免影响下载）
 unset HF_ENDPOINT
 
-# torch.compile 编译缓存：使用项目内目录，第二次及以后运行可复用，避免重复编译
+# torch.compile 编译缓存：使用项目内目录，第二次及以后运行可复用
 export TORCHINDUCTOR_FX_GRAPH_CACHE=1
 export TORCHINDUCTOR_CACHE_DIR=".elefant_temp/torch_compiler/inductor_cache"
-
-# 设置 CUDA 设备（如果需要指定特定 GPU）
-# export CUDA_VISIBLE_DEVICES=0
 
 # ⚠️ 关键：清理 /dev/shm 中的所有 PyTorch 残留文件
 echo -e "${YELLOW}清理 /dev/shm 中的 PyTorch 共享内存文件...${NC}"
@@ -184,11 +181,12 @@ else
 fi
 echo -e "${GREEN}========================================${NC}\n"
 
-# 使用 uv 运行训练脚本
+# 使用 uv 运行训练脚本（禁用 torch.compile）
 # 注意：--data_folder 参数会覆盖配置文件中的 local_prefix
 uv run elefant/policy_model/train.py \
     --config "$TRAIN_CONFIG" \
-    --data_folder "$DATA_FOLDER"
+    --data_folder "$DATA_FOLDER" \
+    --no_compile
 
 echo -e "\n${GREEN}========================================${NC}"
 echo -e "${GREEN}训练完成！${NC}"

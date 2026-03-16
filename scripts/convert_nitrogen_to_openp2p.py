@@ -15,6 +15,8 @@ Key points:
 import argparse
 import json
 import uuid
+import shutil
+import subprocess
 from pathlib import Path
 from typing import Optional
 
@@ -227,10 +229,98 @@ def create_video_annotation(
     return video_annotation
 
 
+def make_default_sample_name(nitrogen_metadata: dict) -> str:
+    """Create a deterministic open-p2p sample folder name."""
+    game = nitrogen_metadata.get("game", "unknown").strip().replace(" ", "_").lower()
+    video_id = nitrogen_metadata.get("original_video", {}).get("video_id", "unknown")
+    chunk_id = nitrogen_metadata.get("chunk_id", "unknown")
+    return f"{game}_{video_id}_chunk_{chunk_id}"
+
+
+def infer_source_video_path(
+    nitrogen_chunk_dir: Path,
+    nitrogen_metadata: dict,
+    video_root: Optional[Path] = None,
+) -> Path:
+    """
+    Infer source video path for a NitroGen chunk.
+
+    Typical layout:
+    <root>/<game>/lable_data/actions/SHARD_xxxx/<video_id>/<video_id>_chunk_xxxx/
+    <root>/<game>/<game>/<video_id>/<video_id>_chunk_xxxx.mp4
+    """
+    chunk_name = nitrogen_chunk_dir.name
+    game = nitrogen_metadata.get("game", "").strip()
+    video_id = nitrogen_metadata.get("original_video", {}).get("video_id", "").strip()
+    if not game or not video_id:
+        raise ValueError(
+            f"Invalid metadata for video inference. game={game!r}, video_id={video_id!r}"
+        )
+
+    if video_root is not None:
+        candidate = video_root / game / game / video_id / f"{chunk_name}.mp4"
+        if candidate.exists():
+            return candidate
+        raise FileNotFoundError(f"Could not find source video from --video-root: {candidate}")
+
+    # Auto infer from chunk path by locating ".../<game>/lable_data/actions/..."
+    parts = nitrogen_chunk_dir.parts
+    if "lable_data" in parts:
+        lable_idx = parts.index("lable_data")
+        if lable_idx > 0:
+            game_root = Path(*parts[:lable_idx])
+            candidate = game_root / game / video_id / f"{chunk_name}.mp4"
+            if candidate.exists():
+                return candidate
+
+    raise FileNotFoundError(
+        f"Could not infer source video for chunk {nitrogen_chunk_dir}. "
+        "Use --video-root to provide NitroGen root explicitly."
+    )
+
+
+def generate_192x192_video_with_bbox(
+    source_video_path: Path,
+    output_192_path: Path,
+    nitrogen_metadata: dict,
+):
+    """Crop game area via bbox_game_area then resize to 192x192 using ffmpeg."""
+    bbox = nitrogen_metadata.get("bbox_game_area")
+    if not bbox:
+        raise ValueError(
+            f"bbox_game_area not found in metadata; cannot generate 192x192 for {source_video_path}"
+        )
+    xtl = float(bbox["xtl"])
+    ytl = float(bbox["ytl"])
+    xbr = float(bbox["xbr"])
+    ybr = float(bbox["ybr"])
+    crop_w = xbr - xtl
+    crop_h = ybr - ytl
+    if crop_w <= 0 or crop_h <= 0:
+        raise ValueError(f"Invalid bbox_game_area: {bbox}")
+
+    vf = f"crop=iw*{crop_w}:ih*{crop_h}:iw*{xtl}:ih*{ytl},scale=192:192"
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(source_video_path),
+        "-vf",
+        vf,
+        "-an",
+        str(output_192_path),
+    ]
+    subprocess.run(cmd, check=True)
+
+
 def convert_nitrogen_chunk(
     nitrogen_chunk_dir: Path,
     output_base_dir: Path,
     sample_uuid: Optional[str] = None,
+    copy_video: bool = False,
+    generate_192: bool = False,
+    video_root: Optional[Path] = None,
+    overwrite: bool = False,
 ) -> Path:
     """
     Convert a single NitroGen chunk to open-p2p format.
@@ -243,14 +333,6 @@ def convert_nitrogen_chunk(
     Returns:
         Path to the created output directory
     """
-    # Generate UUID if not provided
-    if sample_uuid is None:
-        sample_uuid = str(uuid.uuid4())
-    
-    # Create output directory
-    output_dir = output_base_dir / sample_uuid
-    output_dir.mkdir(parents=True, exist_ok=True)
-    
     # Load NitroGen data
     metadata_path = nitrogen_chunk_dir / 'metadata.json'
     actions_path = nitrogen_chunk_dir / 'actions_processed.parquet'
@@ -262,6 +344,14 @@ def convert_nitrogen_chunk(
     
     nitrogen_metadata = load_nitrogen_metadata(metadata_path)
     actions_df = load_nitrogen_actions(actions_path)
+
+    # Generate deterministic sample name if not provided
+    if sample_uuid is None:
+        sample_uuid = make_default_sample_name(nitrogen_metadata)
+
+    # Create output directory
+    output_dir = output_base_dir / sample_uuid
+    output_dir.mkdir(parents=True, exist_ok=True)
     
     print(f"Converting chunk: {nitrogen_chunk_dir.name}")
     print(f"  Video ID: {nitrogen_metadata['original_video']['video_id']}")
@@ -283,10 +373,30 @@ def convert_nitrogen_chunk(
     
     print(f"  Created: {annotation_path}")
     print(f"  Output directory: {output_dir}")
-    
-    # Note: Video files need to be downloaded separately from NitroGen video dataset
-    # For now, we only create the annotation.proto file
-    
+
+    if copy_video or generate_192:
+        source_video_path = infer_source_video_path(
+            nitrogen_chunk_dir, nitrogen_metadata, video_root=video_root
+        )
+        target_video_path = output_dir / "video.mp4"
+        if overwrite or not target_video_path.exists():
+            shutil.copy2(source_video_path, target_video_path)
+            print(f"  Copied: {target_video_path}")
+        else:
+            print(f"  Skipped existing: {target_video_path}")
+
+        if generate_192:
+            output_192_path = output_dir / "192x192.mp4"
+            if overwrite or not output_192_path.exists():
+                generate_192x192_video_with_bbox(
+                    source_video_path=target_video_path,
+                    output_192_path=output_192_path,
+                    nitrogen_metadata=nitrogen_metadata,
+                )
+                print(f"  Generated: {output_192_path}")
+            else:
+                print(f"  Skipped existing: {output_192_path}")
+
     return output_dir
 
 
@@ -311,11 +421,33 @@ def main():
         action='store_true',
         help='Recursively find all chunks in input directory',
     )
+    parser.add_argument(
+        '--copy-video',
+        action='store_true',
+        help='Copy source chunk video to output as video.mp4',
+    )
+    parser.add_argument(
+        '--generate-192',
+        action='store_true',
+        help='Generate 192x192.mp4 using bbox_game_area (requires ffmpeg)',
+    )
+    parser.add_argument(
+        '--video-root',
+        type=str,
+        default=None,
+        help='NitroGen dataset root for locating source videos (optional, auto-infer if omitted)',
+    )
+    parser.add_argument(
+        '--overwrite',
+        action='store_true',
+        help='Overwrite existing video.mp4 / 192x192.mp4 if present',
+    )
     args = parser.parse_args()
     
     input_path = Path(args.input)
     output_base_dir = Path(args.output)
     output_base_dir.mkdir(parents=True, exist_ok=True)
+    video_root = Path(args.video_root) if args.video_root else None
     
     if args.recursive:
         # Find all chunk directories (containing metadata.json and actions_processed.parquet)
@@ -328,13 +460,27 @@ def main():
         print(f"Found {len(chunk_dirs)} chunks to convert")
         for chunk_dir in chunk_dirs:
             try:
-                convert_nitrogen_chunk(chunk_dir, output_base_dir)
+                convert_nitrogen_chunk(
+                    chunk_dir,
+                    output_base_dir,
+                    copy_video=args.copy_video,
+                    generate_192=args.generate_192,
+                    video_root=video_root,
+                    overwrite=args.overwrite,
+                )
             except Exception as e:
                 print(f"Error converting {chunk_dir}: {e}")
                 continue
     else:
         # Single chunk directory
-        convert_nitrogen_chunk(input_path, output_base_dir)
+        convert_nitrogen_chunk(
+            input_path,
+            output_base_dir,
+            copy_video=args.copy_video,
+            generate_192=args.generate_192,
+            video_root=video_root,
+            overwrite=args.overwrite,
+        )
     
     print(f"\nConversion complete! Output directory: {output_base_dir}")
 

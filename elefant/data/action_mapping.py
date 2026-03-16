@@ -18,6 +18,14 @@ class StructuredAction(NamedTuple):
     mouse_delta_y: torch.Tensor
 
 
+class DecodedGamepadAction(NamedTuple):
+    buttons_down: List[str]
+    left_stick: tuple[float, float]
+    right_stick: tuple[float, float]
+    left_trigger: float
+    right_trigger: float
+
+
 class UniversalAutoregressiveActionMappingConfig(ConfigBase):
     max_keys: int = pydantic.Field(
         default=4,
@@ -734,6 +742,18 @@ class GamepadAutoregressiveActionMapping:
         # max_buttons button slots + 4 stick axes + 2 triggers
         return self.config.max_buttons + 6
 
+    def get_number_of_button_actions(self) -> int:
+        return self.config.max_buttons
+
+    def get_number_of_button_choices(self) -> int:
+        return max(v for v in GAMEPAD_BUTTON_ENCODING_MAP.values() if v is not None) + 1
+
+    def get_n_stick_bins(self) -> int:
+        return self.config.n_stick_bins
+
+    def get_n_trigger_bins(self) -> int:
+        return self.config.n_trigger_bins
+
     def make_empty_action(self, T: int) -> torch.Tensor:
         """
         Create an empty action tensor for T time steps.
@@ -761,6 +781,20 @@ class GamepadAutoregressiveActionMapping:
         v = max(0.0, min(1.0, float(value)))
         idx = int(round(v * (self.config.n_trigger_bins - 1)))
         return max(0, min(self.config.n_trigger_bins - 1, idx))
+
+    def _dequantize_stick(self, idx: int) -> float:
+        """Dequantize stick axis index back to [-1, 1]."""
+        i = max(0, min(self.config.n_stick_bins - 1, int(idx)))
+        if self.config.n_stick_bins <= 1:
+            return 0.0
+        return (i / (self.config.n_stick_bins - 1)) * 2.0 - 1.0
+
+    def _dequantize_trigger(self, idx: int) -> float:
+        """Dequantize trigger index back to [0, 1]."""
+        i = max(0, min(self.config.n_trigger_bins - 1, int(idx)))
+        if self.config.n_trigger_bins <= 1:
+            return 0.0
+        return i / (self.config.n_trigger_bins - 1)
 
     def action_to_tensor(self, gamepad_actions) -> torch.Tensor:
         """
@@ -819,3 +853,65 @@ class GamepadAutoregressiveActionMapping:
         assert len(tokens) == self.get_seq_len()
 
         return torch.tensor([tokens], dtype=torch.long)
+
+    def tensor_to_action(
+        self,
+        action: torch.Tensor,
+        mouse_sampling_approach: str = "mean",
+    ) -> DecodedGamepadAction:
+        """
+        Decode a (1, seq_len) gamepad token tensor to semantic gamepad actions.
+
+        The mouse_sampling_approach argument is accepted for API compatibility with
+        UniversalAutoregressiveActionMapping, but is not used here.
+        """
+        _ = mouse_sampling_approach
+        assert action.shape == (1, self.get_seq_len())
+        tokens = action[0].tolist()
+
+        button_tokens = tokens[: self.config.max_buttons]
+        axis_tokens = tokens[self.config.max_buttons :]
+        assert len(axis_tokens) == 6
+
+        reverse_button_map = {
+            v: k for k, v in GAMEPAD_BUTTON_ENCODING_MAP.items() if v is not None
+        }
+
+        buttons_down: List[str] = []
+        for token in button_tokens:
+            button_name = reverse_button_map.get(int(token), "_no_button")
+            if button_name != "_no_button" and button_name not in buttons_down:
+                buttons_down.append(button_name)
+
+        lx_idx, ly_idx, rx_idx, ry_idx, lt_idx, rt_idx = axis_tokens
+        left_stick = (
+            self._dequantize_stick(lx_idx),
+            self._dequantize_stick(ly_idx),
+        )
+        right_stick = (
+            self._dequantize_stick(rx_idx),
+            self._dequantize_stick(ry_idx),
+        )
+        left_trigger = self._dequantize_trigger(lt_idx)
+        right_trigger = self._dequantize_trigger(rt_idx)
+
+        return DecodedGamepadAction(
+            buttons_down=buttons_down,
+            left_stick=left_stick,
+            right_stick=right_stick,
+            left_trigger=left_trigger,
+            right_trigger=right_trigger,
+        )
+
+    def serialize(self) -> str:
+        """Serialize gamepad mapping config to a JSON string."""
+        data = {
+            "type": "gamepad",
+            "max_buttons": self.config.max_buttons,
+            "n_stick_bins": self.config.n_stick_bins,
+            "n_trigger_bins": self.config.n_trigger_bins,
+            "stick_deadzone": self.config.stick_deadzone,
+            "button_encoding_map": deepcopy(GAMEPAD_BUTTON_ENCODING_MAP),
+            "button_order": deepcopy(GAMEPAD_BUTTON_ORDER),
+        }
+        return json.dumps(data)

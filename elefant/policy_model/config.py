@@ -6,6 +6,7 @@ from elefant.data import (
     RandAugmentationConfig,
     UniversalAutoregressiveActionMappingConfig,
 )
+from elefant.data.action_mapping import GamepadAutoregressiveActionMappingConfig
 from elefant.config import WandbConfig
 from elefant.im_tokenizer.config import ImageTokenizerConfig
 from elefant.text_tokenizer.config import TextTokenizerConfig
@@ -176,6 +177,10 @@ class SharedConfig(ConfigBase):
     text_tokenizer_config: TextTokenizerConfig = TextTokenizerConfig()
     action_mapping: UniversalAutoregressiveActionMappingConfig = (
         UniversalAutoregressiveActionMappingConfig()
+    )
+    action_mapping_type: Literal["keyboard_mouse", "gamepad"] = "keyboard_mouse"
+    gamepad_action_mapping: GamepadAutoregressiveActionMappingConfig = (
+        GamepadAutoregressiveActionMappingConfig()
     )
 
 
