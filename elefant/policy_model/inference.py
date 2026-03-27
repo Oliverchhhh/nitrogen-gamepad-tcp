@@ -688,6 +688,95 @@ class InferenceServer(UnixDomainSocketInferenceServer):
         self.device_idx = device_idx
         logging.info(f"Using device: {self.device}")
 
+    @staticmethod
+    def _empty_mouse_action() -> video_inference_pb2.MouseAction:
+        return video_inference_pb2.MouseAction(
+            buttons_down=[],
+            mouse_delta_px=shared_pb2.Vec2Int(x=0, y=0),
+        )
+
+    @staticmethod
+    def _legacy_encode_gamepad_to_keys(action: DecodedGamepadAction) -> List[str]:
+        encoded_keys = [f"gamepad:{btn}" for btn in action.buttons_down]
+        encoded_keys.extend(
+            [
+                f"gamepad:lx={action.left_stick[0]:.4f}",
+                f"gamepad:ly={action.left_stick[1]:.4f}",
+                f"gamepad:rx={action.right_stick[0]:.4f}",
+                f"gamepad:ry={action.right_stick[1]:.4f}",
+                f"gamepad:lt={action.left_trigger:.4f}",
+                f"gamepad:rt={action.right_trigger:.4f}",
+            ]
+        )
+        return encoded_keys
+
+    @staticmethod
+    def _set_stick_fields(stick_msg, stick_values: Tuple[float, float]) -> None:
+        fields = set(stick_msg.DESCRIPTOR.fields_by_name.keys())
+        if "x" in fields:
+            stick_msg.x = float(stick_values[0])
+        if "y" in fields:
+            stick_msg.y = float(stick_values[1])
+
+    def _build_native_gamepad_action(
+        self, action: DecodedGamepadAction, frame_id: int
+    ) -> Optional[video_inference_pb2.Action]:
+        """
+        Build Action with native gamepad field when proto supports it.
+        Returns None when current proto has no gamepad field.
+        """
+        action_desc = video_inference_pb2.Action.DESCRIPTOR
+        native_field_name = None
+        for candidate in ("gamepad_action", "game_pad_action", "controller_action"):
+            if candidate in action_desc.fields_by_name:
+                native_field_name = candidate
+                break
+
+        if native_field_name is None:
+            return None
+
+        field_desc = action_desc.fields_by_name[native_field_name]
+        msg_cls = getattr(video_inference_pb2, field_desc.message_type.name, None)
+        if msg_cls is None:
+            logging.warning(
+                "Found native gamepad field '%s' but message class '%s' is unavailable",
+                native_field_name,
+                field_desc.message_type.name,
+            )
+            return None
+
+        gamepad_msg = msg_cls()
+        gamepad_fields = set(gamepad_msg.DESCRIPTOR.fields_by_name.keys())
+
+        if "buttons_down" in gamepad_fields:
+            gamepad_msg.buttons_down.extend(action.buttons_down)
+        elif "pressed_buttons" in gamepad_fields:
+            gamepad_msg.pressed_buttons.extend(action.buttons_down)
+        elif "buttons" in gamepad_fields:
+            # If proto exposes a typed buttons message, set bool fields by name.
+            buttons_msg = getattr(gamepad_msg, "buttons")
+            button_fields = set(buttons_msg.DESCRIPTOR.fields_by_name.keys())
+            for btn in action.buttons_down:
+                if btn in button_fields:
+                    setattr(buttons_msg, btn, True)
+
+        if "left_stick" in gamepad_fields:
+            self._set_stick_fields(gamepad_msg.left_stick, action.left_stick)
+        if "right_stick" in gamepad_fields:
+            self._set_stick_fields(gamepad_msg.right_stick, action.right_stick)
+        if "left_trigger" in gamepad_fields:
+            gamepad_msg.left_trigger = float(action.left_trigger)
+        if "right_trigger" in gamepad_fields:
+            gamepad_msg.right_trigger = float(action.right_trigger)
+
+        response_action = video_inference_pb2.Action(id=frame_id)
+        if "keys" in action_desc.fields_by_name:
+            response_action.keys.extend([])
+        if "mouse_action" in action_desc.fields_by_name:
+            response_action.mouse_action.CopyFrom(self._empty_mouse_action())
+        getattr(response_action, native_field_name).CopyFrom(gamepad_msg)
+        return response_action
+
     def fps_test(self, n_frames: int = 100):
         with torch.inference_mode():
             self.inference_state.reset()  # Reset the inference state if using KV cache
@@ -796,28 +885,18 @@ class InferenceServer(UnixDomainSocketInferenceServer):
                         )
                         time_since_last_frame_ns = time.time_ns()
                         if isinstance(action, DecodedGamepadAction):
-                            # Transport protocol currently has no native gamepad field.
-                            # Encode decoded gamepad semantics into keys with a prefix.
-                            encoded_keys = [
-                                f"gamepad:{btn}" for btn in action.buttons_down
-                            ]
-                            encoded_keys.extend(
-                                [
-                                    f"gamepad:lx={action.left_stick[0]:.4f}",
-                                    f"gamepad:ly={action.left_stick[1]:.4f}",
-                                    f"gamepad:rx={action.right_stick[0]:.4f}",
-                                    f"gamepad:ry={action.right_stick[1]:.4f}",
-                                    f"gamepad:lt={action.left_trigger:.4f}",
-                                    f"gamepad:rt={action.right_trigger:.4f}",
-                                ]
+                            # Prefer native gamepad transport if proto supports it.
+                            # Fallback to legacy keys-encoding for backward compatibility.
+                            response_action = self._build_native_gamepad_action(
+                                action, frame_id
                             )
-                            mouse = video_inference_pb2.MouseAction(
-                                buttons_down=[],
-                                mouse_delta_px=shared_pb2.Vec2Int(x=0, y=0),
-                            )
-                            response_action = video_inference_pb2.Action(
-                                keys=encoded_keys, id=frame_id, mouse_action=mouse
-                            )
+                            if response_action is None:
+                                encoded_keys = self._legacy_encode_gamepad_to_keys(action)
+                                response_action = video_inference_pb2.Action(
+                                    keys=encoded_keys,
+                                    id=frame_id,
+                                    mouse_action=self._empty_mouse_action(),
+                                )
                         else:
                             mouse = video_inference_pb2.MouseAction(
                                 buttons_down=action.mouse_buttons,
