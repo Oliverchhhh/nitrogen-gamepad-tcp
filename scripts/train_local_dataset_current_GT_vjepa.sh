@@ -1,13 +1,14 @@
 #!/bin/bash
-# 使用本地 dataset 目录训练模型的脚本
+# 使用本地 dataset 目录训练 Current Vision（输入 conv，state GT 使用 vjepa2.1）的 Stage3 模型脚本
 
 set -e  # 遇到错误立即退出
 
 # 配置变量
-CONFIG_FILE="config/policy_model/150M_local_dataset.yaml"
-DATA_FOLDER="NitroGen_cuphead"  # 数据集路径（相对于项目根目录）
+CONFIG_FILE="config/policy_model/150M_local_nitrogen_dataset_current.yaml"
+DATA_FOLDER="dataset"  # 数据集路径（相对于项目根目录）
 OUTPUT_DIR=""  # 输出目录（可选，不传则使用配置文件中的 shared.output_path）
 TEMP_CONFIG_FILE=""
+NO_COMPILE=false
 
 # 颜色输出
 GREEN='\033[0;32m'
@@ -16,25 +17,27 @@ RED='\033[0;31m'
 NC='\033[0m' # No Color
 
 usage() {
-    echo "用法: bash scripts/train_local_dataset.sh [-d 数据集路径] [-o 输出目录] [-c 配置文件]"
+    echo "用法: bash scripts/train_local_dataset_current_GT_vjepa.sh [-d 数据集路径] [-o 输出目录] [-c 配置文件] [-n]"
     echo
     echo "参数:"
     echo "  -d    数据集路径 (默认: dataset)"
     echo "  -o    输出目录。传入后将覆盖配置文件中的 shared.output_path"
-    echo "  -c    配置文件路径 (默认: config/policy_model/150M_local_dataset.yaml)"
+    echo "  -c    配置文件路径 (默认: config/policy_model/150M_local_nitrogen_dataset_current.yaml)"
+    echo "  -n    禁用 torch.compile（向 train_future.py 透传 --no_compile）"
     echo "  -h    显示帮助"
     echo
     echo "示例:"
-    echo "  bash scripts/train_local_dataset.sh"
-    echo "  bash scripts/train_local_dataset.sh -d dataset_toy"
-    echo "  bash scripts/train_local_dataset.sh -d dataset -o ./output_20260316"
+    echo "  bash scripts/train_local_dataset_current_GT_vjepa.sh"
+    echo "  bash scripts/train_local_dataset_current_GT_vjepa.sh -c config/policy_model/150M_local_nitrogen_dataset_current.yaml -d NitroGen_cuphead"
+    echo "  bash scripts/train_local_dataset_current_GT_vjepa.sh -c config/policy_model/150M_local_nitrogen_dataset_current.yaml -d NitroGen_cuphead -n"
 }
 
-while getopts ":d:o:c:h" opt; do
+while getopts ":d:o:c:nh" opt; do
     case "$opt" in
         d) DATA_FOLDER="$OPTARG" ;;
         o) OUTPUT_DIR="$OPTARG" ;;
         c) CONFIG_FILE="$OPTARG" ;;
+        n) NO_COMPILE=true ;;
         h)
             usage
             exit 0
@@ -61,7 +64,7 @@ cleanup() {
 trap cleanup EXIT
 
 echo -e "${GREEN}========================================${NC}"
-echo -e "${GREEN}Open P2P 本地数据集训练脚本${NC}"
+echo -e "${GREEN}Open P2P Current 训练脚本（GT: VJEPA2.1）${NC}"
 echo -e "${GREEN}========================================${NC}"
 
 # 1. 检查数据集路径
@@ -94,7 +97,7 @@ TRAIN_CONFIG="$CONFIG_FILE"
 if [ -n "$OUTPUT_DIR" ]; then
     echo -e "${YELLOW}检测到输出目录参数，覆盖 shared.output_path: $OUTPUT_DIR${NC}"
     mkdir -p "$OUTPUT_DIR"
-    TEMP_CONFIG_FILE=$(mktemp /tmp/open_p2p_train_config.XXXXXX.yaml)
+    TEMP_CONFIG_FILE=$(mktemp /tmp/open_p2p_current_gt_vjepa_train_config.XXXXXX.yaml)
 
     YAML_SAFE_OUTPUT_DIR=${OUTPUT_DIR//\'/\'\'}
     if ! awk -v replacement="  output_path: '$YAML_SAFE_OUTPUT_DIR'" '
@@ -136,12 +139,12 @@ echo -e "\n${YELLOW}[4/5] 设置环境变量和检查共享内存...${NC}"
 # 如果设置了 HF 镜像，取消设置（避免影响下载）
 unset HF_ENDPOINT
 
-# torch.compile 编译缓存：使用项目内目录，第二次及以后运行可复用，避免重复编译
+# torch.compile 编译缓存：使用项目内目录，第二次及以后运行可复用
 export TORCHINDUCTOR_FX_GRAPH_CACHE=1
-export TORCHINDUCTOR_CACHE_DIR=".elefant_temp/torch_compiler/inductor_cache"
+export TORCHINDUCTOR_CACHE_DIR=".elefant_temp_current_gt_vjepa/torch_compiler/inductor_cache"
 
-# 设置 CUDA 设备（如果需要指定特定 GPU）
-export CUDA_VISIBLE_DEVICES=0
+# 设置 CUDA 设备（与 train_local_dataset.sh 对齐，默认单卡避免多卡环境异常）
+export CUDA_VISIBLE_DEVICES=1
 echo -e "${GREEN}单卡模式: CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}${NC}"
 
 # ⚠️ 关键：清理 /dev/shm 中的所有 PyTorch 残留文件
@@ -175,7 +178,7 @@ fi
 echo -e "${GREEN}✓ 环境变量设置完成${NC}"
 
 # 5. 开始训练
-echo -e "\n${YELLOW}[5/5] 开始训练...${NC}"
+echo -e "\n${YELLOW}[5/5] 开始训练 (Current + GT VJEPA2.1)...${NC}"
 echo -e "${GREEN}配置文件: $TRAIN_CONFIG${NC}"
 echo -e "${GREEN}数据集路径: $DATA_FOLDER${NC}"
 if [ -n "$OUTPUT_DIR" ]; then
@@ -183,15 +186,19 @@ if [ -n "$OUTPUT_DIR" ]; then
 else
     echo -e "${GREEN}输出目录: 使用配置文件中的 shared.output_path${NC}"
 fi
+if [ "$NO_COMPILE" = true ]; then
+    echo -e "${GREEN}训练模式: no_compile${NC}"
+fi
 echo -e "${GREEN}========================================${NC}\n"
 
-# 使用 uv 运行训练脚本
+# 使用 train_future.py 入口，配合 current 配置进行 current target 训练
 # 注意：--data_folder 参数会覆盖配置文件中的 local_prefix
-# uv run elefant/policy_model/train.py 
-python elefant/policy_model/train.py \
-    --config "$TRAIN_CONFIG" \
-    --data_folder "$DATA_FOLDER"
+CMD=(python elefant/policy_model/train_future.py --config "$TRAIN_CONFIG" --data_folder "$DATA_FOLDER")
+if [ "$NO_COMPILE" = true ]; then
+    CMD+=(--no_compile)
+fi
+"${CMD[@]}"
 
 echo -e "\n${GREEN}========================================${NC}"
-echo -e "${GREEN}训练完成！${NC}"
+echo -e "${GREEN}Current + GT VJEPA2.1 训练完成！${NC}"
 echo -e "${GREEN}========================================${NC}"

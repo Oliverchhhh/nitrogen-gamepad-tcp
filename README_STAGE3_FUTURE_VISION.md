@@ -84,6 +84,41 @@ uv run elefant/policy_model/train_future.py \
   --fast_dev_run
 ```
 
+### 4.3 NitroGen（gamepad）训练示例
+
+Future 版训练现已支持 `gamepad` action mapping，可直接用于 NitroGen 转换后的 open-p2p 样式数据目录。
+
+- **推荐配置**：`config/policy_model/150M_local_nitrogen_dataset_future.yaml`
+- **关键点**：
+  - `shared.action_mapping_type: "gamepad"`
+  - `shared.gamepad_action_mapping.*`
+  - `stage3_finetune.training_dataset.local_prefix` 与 `validation_datasets[].local_prefix` 指向 NitroGen 数据目录
+
+使用脚本（推荐）：
+
+```bash
+bash scripts/train_local_dataset_future.sh \
+  -c config/policy_model/150M_local_nitrogen_dataset_future.yaml \
+  -d dataset_nitrogen_toy \
+  -n
+```
+
+参数说明：
+
+- `-c`：指定 future 配置（可切换到 nitrogen future 配置）
+- `-d`：指定数据目录（覆盖配置中的 `local_prefix`）
+- `-n`：透传 `--no_compile`，用于规避部分环境下的编译问题
+- `-o`：可选，覆盖配置中的 `shared.output_path`
+
+也可以直接用 Python 入口：
+
+```bash
+uv run elefant/policy_model/train_future.py \
+  --config config/policy_model/150M_local_nitrogen_dataset_future.yaml \
+  --data_folder dataset_nitrogen_toy \
+  --no_compile
+```
+
 ---
 
 ## 5. 输出与恢复
@@ -101,9 +136,10 @@ uv run elefant/policy_model/train_future.py \
   - 项目名、entity 等由配置中 `wandb` 决定；  
   - 实验名会带后缀 `_stage3_future_vision`，例如 `150M-local-dataset-future_stage3_future_vision`。
 - **训练指标**（每 50 步 log）：  
-  - `train/loss_total`、`train/loss_action`、`train/loss_future_vision`  
-  - `train/loss_key`、`train/loss_mouse_button`、`train/loss_mouse_delta_x`、`train/loss_mouse_delta_y`  
-  验证阶段会计算并记录对应的 validation 指标。
+  - 通用：`train/loss_total`、`train/loss_action`、`train/loss_future_vision`
+  - 键鼠映射时：`train/loss_key`、`train/loss_mouse_button`、`train/loss_mouse_delta_x`、`train/loss_mouse_delta_y`
+  - gamepad 映射时：`train/loss_gamepad_button`、`train/loss_left_stick_x`、`train/loss_left_stick_y`、`train/loss_right_stick_x`、`train/loss_right_stick_y`、`train/loss_left_trigger`、`train/loss_right_trigger`
+  - 验证阶段会计算并记录对应的 validation 指标。
 
 ---
 
@@ -174,4 +210,4 @@ uv run elefant/policy_model/train_future.py \
 
 ---
 
-以上即可完成 Future 版 Stage3（Stage3FutureVisionLightning）的训练与恢复；更多超参请直接编辑 `config/policy_model/150M_local_dataset_future.yaml`。
+以上即可完成 Future 版 Stage3（Stage3FutureVisionLightning）的训练与恢复；更多超参请按任务场景编辑配置文件（如 `config/policy_model/150M_local_dataset_future.yaml` 或 `config/policy_model/150M_local_nitrogen_dataset_future.yaml`）。

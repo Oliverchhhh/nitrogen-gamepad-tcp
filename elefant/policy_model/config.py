@@ -115,6 +115,13 @@ class Stage3InitConfig(ConfigBase):
         default=None,
         description="If loading checkpoints from a different path from the output path this is set. It should point directly at a checkpoint file, not a folder.",
     )
+    auto_resume_latest_checkpoint: bool = pydantic.Field(
+        default=True,
+        description=(
+            "If true and stage3_model_path is unset, automatically resume from the latest "
+            "checkpoint in the output directory."
+        ),
+    )
 
 
 class PolicyTrainingConfig(ConfigBase):
@@ -159,6 +166,21 @@ class PolicyTrainingConfig(ConfigBase):
 
 class Stage3FineTuneConfig(PolicyTrainingConfig):
     init: Stage3InitConfig = pydantic.Field(default=Stage3InitConfig())
+    future_vision_target_mode: Literal["future", "current"] = pydantic.Field(
+        default="future",
+        description=(
+            "Target construction mode for s0 state supervision in stage3 future vision. "
+            "'future' predicts next-frame global visual token; "
+            "'current' reconstructs current-frame global visual token."
+        ),
+    )
+    state_target_tokenizer: Optional[ImageTokenizerConfig] = pydantic.Field(
+        default=None,
+        description=(
+            "Optional tokenizer used only to build state supervision targets. "
+            "If unset, use shared.tokenizer."
+        ),
+    )
 
 
 class SharedConfig(ConfigBase):

@@ -2,6 +2,7 @@ import logging
 
 import lightning as pl
 import torch
+import torch._dynamo as dynamo
 import os
 import wandb
 import fsspec
@@ -38,6 +39,7 @@ from elefant.data.action_mapping import UniversalAutoregressiveActionMapping
 from elefant.metrics import LossMetric
 from elefant.policy_model.config import DatasetConfig, ValidationDatasetConfig
 from lightning.fabric.utilities.cloud_io import get_filesystem
+from elefant.im_tokenizer import get_tokenizer
 
 
 def upload_model_config(checkpoint_path: str, config):
@@ -950,43 +952,19 @@ class PolicyModelTrainer(ModelFreePolicy):
             mouse_delta_y_z_loss,
         )
 
-    def _calculate_loss(self, batch, actions_in, masked_labels, text_tokens_embed):
+    @dynamo.disable
+    def _calculate_action_losses_from_logits_eager(
+        self,
+        action_logits,
+        masked_labels,
+        auxiliary_losses,
+        batch_size: int,
+        T: int,
+    ):
         """
-        Calculate the loss for the given batch of actions.
-        batch: batch from dataloader
-        actions_in: action sequence correspond to frames, use ground truth action for labeled data and pseudo labels for unlabeled data
-        masked_labels: action sequence masked with user action mask, same as action_in for unlabeled data
+        Compute CE/z auxiliary losses outside torch.compile graph.
+        This avoids Triton/Inductor over-fusing large loss expressions.
         """
-        frames = self._normalize_frames(batch.frames)
-        batch_size = batch.frames.shape[0]
-        T = batch.frames.shape[1]
-        action_embeddings_in = self.action_in_to_tokens(actions_in)
-        eager_assert(
-            action_embeddings_in.shape,
-            (
-                batch_size,
-                T,
-                self.n_actions,
-                self.config.policy_model.action_decoder.embed_dim,
-            ),
-        )
-        action_out_embeddings, _, auxiliary_losses, auxiliary_outputs = (
-            self.transformer_forward_function(
-                frames, action_embeddings_in, text_tokens_embed
-            )
-        )
-        eager_assert(
-            action_out_embeddings.shape,
-            (
-                batch_size,
-                T,
-                self.n_actions,
-                self.config.policy_model.action_decoder.embed_dim,
-            ),
-        )
-
-        action_logits = self.action_out_tokens_to_logits(action_out_embeddings)
-
         if self._use_gamepad_mapping():
             k = self.n_gamepad_button_actions
             gamepad_button_loss = F.cross_entropy(
@@ -1025,8 +1003,12 @@ class PolicyModelTrainer(ModelFreePolicy):
                 ignore_index=-100,
             )
 
-            lb_loss = auxiliary_losses.get("lb_loss", torch.tensor(0.0))
-            rz_loss = auxiliary_losses.get("rz_loss", torch.tensor(0.0))
+            lb_loss = auxiliary_losses.get(
+                "lb_loss", action_logits.buttons.new_zeros(())
+            )
+            rz_loss = auxiliary_losses.get(
+                "rz_loss", action_logits.buttons.new_zeros(())
+            )
             losses = {
                 "gamepad_button": gamepad_button_loss,
                 "left_stick_x": left_stick_x_loss,
@@ -1075,7 +1057,7 @@ class PolicyModelTrainer(ModelFreePolicy):
                 + lb_loss * self.lb_loss_weight
                 + rz_loss * self.rz_loss_weight
             )
-            return loss, cross_entropy_loss, losses, auxiliary_outputs
+            return loss, cross_entropy_loss, losses
 
         eager_assert(
             action_logits.keys.shape,
@@ -1114,8 +1096,8 @@ class PolicyModelTrainer(ModelFreePolicy):
             target=masked_labels.mouse_delta_y.view(-1),
             ignore_index=-100,
         )
-        lb_loss = auxiliary_losses.get("lb_loss", torch.tensor(0.0))
-        rz_loss = auxiliary_losses.get("rz_loss", torch.tensor(0.0))
+        lb_loss = auxiliary_losses.get("lb_loss", action_logits.keys.new_zeros(()))
+        rz_loss = auxiliary_losses.get("rz_loss", action_logits.keys.new_zeros(()))
         losses = {
             "key": key_loss,
             "mouse_button": mouse_button_loss,
@@ -1147,6 +1129,51 @@ class PolicyModelTrainer(ModelFreePolicy):
             + mouse_button_loss / torch.log(torch.tensor(self.n_mouse_button_choices))
             + mouse_delta_x_loss / torch.log(torch.tensor(self.n_mouse_x_bins))
             + mouse_delta_y_loss / torch.log(torch.tensor(self.n_mouse_y_bins))
+        )
+        return loss, cross_entropy_loss, losses
+
+    def _calculate_loss(self, batch, actions_in, masked_labels, text_tokens_embed):
+        """
+        Calculate the loss for the given batch of actions.
+        batch: batch from dataloader
+        actions_in: action sequence correspond to frames, use ground truth action for labeled data and pseudo labels for unlabeled data
+        masked_labels: action sequence masked with user action mask, same as action_in for unlabeled data
+        """
+        frames = self._normalize_frames(batch.frames)
+        batch_size = batch.frames.shape[0]
+        T = batch.frames.shape[1]
+        action_embeddings_in = self.action_in_to_tokens(actions_in)
+        eager_assert(
+            action_embeddings_in.shape,
+            (
+                batch_size,
+                T,
+                self.n_actions,
+                self.config.policy_model.action_decoder.embed_dim,
+            ),
+        )
+        action_out_embeddings, _, auxiliary_losses, auxiliary_outputs = (
+            self.transformer_forward_function(
+                frames, action_embeddings_in, text_tokens_embed
+            )
+        )
+        eager_assert(
+            action_out_embeddings.shape,
+            (
+                batch_size,
+                T,
+                self.n_actions,
+                self.config.policy_model.action_decoder.embed_dim,
+            ),
+        )
+
+        action_logits = self.action_out_tokens_to_logits(action_out_embeddings)
+        loss, cross_entropy_loss, losses = self._calculate_action_losses_from_logits_eager(
+            action_logits=action_logits,
+            masked_labels=masked_labels,
+            auxiliary_losses=auxiliary_losses,
+            batch_size=batch_size,
+            T=T,
         )
         return loss, cross_entropy_loss, losses, auxiliary_outputs
 
@@ -1447,9 +1474,9 @@ class Stage3LabelledBCLightning(PolicyModelTrainer):
             inference_mode=inference_mode,
         )
         if self.config.policy_model.model_type == "sparse_moe":
-            self.compile_mode = torch.compile(fullgraph=True)
+            self.compile_mode = torch.compile()
         else:
-            self.compile_mode = torch.compile(fullgraph=True, mode="max-autotune")
+            self.compile_mode = torch.compile(mode="max-autotune")
 
         self.transformer_forward_function = self.bc_transformer.forward
 
@@ -1496,6 +1523,20 @@ class Stage3FutureVisionLightning(PolicyModelTrainer):
             stage_name="stage3_future_vision",
             inference_mode=inference_mode,
         )
+        self.future_vision_target_mode = self.config.stage3_finetune.future_vision_target_mode
+        self.state_target_tokenizer = None
+        target_tokenizer_cfg = self.config.stage3_finetune.state_target_tokenizer
+        if target_tokenizer_cfg is not None:
+            self.state_target_tokenizer = get_tokenizer(
+                target_tokenizer_cfg,
+                self.config.policy_model.transformer_dim,
+                self.config.shared.frame_height,
+                self.config.shared.frame_width,
+            )
+            # State target tokenizer only provides detached supervision targets.
+            self.state_target_tokenizer.eval()
+            for param in self.state_target_tokenizer.parameters():
+                param.requires_grad = False
         
         # Replace bc_transformer with PolicyFutureCausalTransformer
         from elefant.policy_model.policy_transformer import (
@@ -1540,15 +1581,187 @@ class Stage3FutureVisionLightning(PolicyModelTrainer):
             )
         
         if self.config.policy_model.model_type == "sparse_moe":
-            self.compile_mode = torch.compile(fullgraph=True)
+            self.compile_mode = torch.compile()
         else:
-            self.compile_mode = torch.compile(fullgraph=True, mode="max-autotune")
+            self.compile_mode = torch.compile(mode="max-autotune")
 
         self.transformer_forward_function = self.bc_transformer.forward
 
     def _get_transformer_mask_fn(self):
         # Use the default, causal mask.
         return None
+
+    def _build_state_target(
+        self,
+        frames: torch.Tensor,
+        future_vision_pred: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Build state supervision target for s0 branch.
+        Modes:
+        - future: next-frame global visual feature (last step uses dummy zeros)
+        - current: current-frame global visual feature reconstruction
+        """
+        target_tokenizer = self.state_target_tokenizer or self.image_tokenizer
+        if self.future_vision_target_mode == "current":
+            with torch.no_grad():
+                current_frames_tokens = target_tokenizer(frames)
+            current_frames_global = current_frames_tokens.mean(dim=2)
+            return current_frames_global.detach()
+
+        # default "future"
+        next_frames = frames[:, 1:, :, :, :]
+        with torch.no_grad():
+            next_frames_tokens = target_tokenizer(next_frames)
+        next_frames_global = next_frames_tokens.mean(dim=2)
+        dummy_global = torch.zeros_like(future_vision_pred[:, 0:1, :])
+        future_vision_target = torch.cat([next_frames_global, dummy_global], dim=1)
+        return future_vision_target.detach()
+
+    @dynamo.disable
+    def _calculate_action_loss_from_logits(self, action_logits, masked_labels, auxiliary_losses):
+        """Calculate action loss from precomputed logits for both mapping types."""
+        if self._use_gamepad_mapping():
+            k = self.n_gamepad_button_actions
+            gamepad_button_loss = F.cross_entropy(
+                input=action_logits.buttons.view(-1, self.n_gamepad_button_choices),
+                target=masked_labels[:, :, :k].reshape(-1),
+                ignore_index=-100,
+            )
+            left_stick_x_loss = F.cross_entropy(
+                input=action_logits.left_stick_x.view(-1, self.n_gamepad_stick_bins),
+                target=masked_labels[:, :, k : k + 1].reshape(-1),
+                ignore_index=-100,
+            )
+            left_stick_y_loss = F.cross_entropy(
+                input=action_logits.left_stick_y.view(-1, self.n_gamepad_stick_bins),
+                target=masked_labels[:, :, k + 1 : k + 2].reshape(-1),
+                ignore_index=-100,
+            )
+            right_stick_x_loss = F.cross_entropy(
+                input=action_logits.right_stick_x.view(-1, self.n_gamepad_stick_bins),
+                target=masked_labels[:, :, k + 2 : k + 3].reshape(-1),
+                ignore_index=-100,
+            )
+            right_stick_y_loss = F.cross_entropy(
+                input=action_logits.right_stick_y.view(-1, self.n_gamepad_stick_bins),
+                target=masked_labels[:, :, k + 3 : k + 4].reshape(-1),
+                ignore_index=-100,
+            )
+            left_trigger_loss = F.cross_entropy(
+                input=action_logits.left_trigger.view(-1, self.n_gamepad_trigger_bins),
+                target=masked_labels[:, :, k + 4 : k + 5].reshape(-1),
+                ignore_index=-100,
+            )
+            right_trigger_loss = F.cross_entropy(
+                input=action_logits.right_trigger.view(-1, self.n_gamepad_trigger_bins),
+                target=masked_labels[:, :, k + 5 : k + 6].reshape(-1),
+                ignore_index=-100,
+            )
+
+            (
+                gamepad_button_z_loss,
+                left_stick_x_z_loss,
+                left_stick_y_z_loss,
+                right_stick_x_z_loss,
+                right_stick_y_z_loss,
+                left_trigger_z_loss,
+                right_trigger_z_loss,
+            ) = self._calculate_z_loss(action_logits, masked_labels)
+
+            lb_loss = auxiliary_losses.get(
+                "lb_loss", action_logits.buttons.new_zeros(())
+            )
+            rz_loss = auxiliary_losses.get(
+                "rz_loss", action_logits.buttons.new_zeros(())
+            )
+            denom_btn = torch.log(torch.tensor(self.n_gamepad_button_choices))
+            denom_stick = torch.log(torch.tensor(self.n_gamepad_stick_bins))
+            denom_trigger = torch.log(torch.tensor(self.n_gamepad_trigger_bins))
+            action_loss = (
+                gamepad_button_loss / denom_btn
+                + left_stick_x_loss / denom_stick
+                + left_stick_y_loss / denom_stick
+                + right_stick_x_loss / denom_stick
+                + right_stick_y_loss / denom_stick
+                + left_trigger_loss / denom_trigger
+                + right_trigger_loss / denom_trigger
+                + (
+                    gamepad_button_z_loss
+                    + left_stick_x_z_loss
+                    + left_stick_y_z_loss
+                    + right_stick_x_z_loss
+                    + right_stick_y_z_loss
+                    + left_trigger_z_loss
+                    + right_trigger_z_loss
+                )
+                * self.z_loss_weight
+                + lb_loss * self.lb_loss_weight
+                + rz_loss * self.rz_loss_weight
+            )
+            losses = {
+                "gamepad_button": gamepad_button_loss,
+                "left_stick_x": left_stick_x_loss,
+                "left_stick_y": left_stick_y_loss,
+                "right_stick_x": right_stick_x_loss,
+                "right_stick_y": right_stick_y_loss,
+                "left_trigger": left_trigger_loss,
+                "right_trigger": right_trigger_loss,
+                "lb_loss": lb_loss,
+                "rz_loss": rz_loss,
+            }
+            return action_loss, losses
+
+        key_loss = F.cross_entropy(
+            input=action_logits.keys.view(-1, self.n_keyboard_choices),
+            target=masked_labels.keys.view(-1),
+            ignore_index=-100,
+        )
+        mouse_button_loss = F.cross_entropy(
+            input=action_logits.mouse_buttons.view(-1, self.n_mouse_button_choices),
+            target=masked_labels.mouse_buttons.view(-1),
+            ignore_index=-100,
+        )
+        mouse_delta_x_loss = F.cross_entropy(
+            input=action_logits.mouse_delta_x.view(-1, self.n_mouse_x_bins),
+            target=masked_labels.mouse_delta_x.view(-1),
+            ignore_index=-100,
+        )
+        mouse_delta_y_loss = F.cross_entropy(
+            input=action_logits.mouse_delta_y.view(-1, self.n_mouse_y_bins),
+            target=masked_labels.mouse_delta_y.view(-1),
+            ignore_index=-100,
+        )
+
+        key_z_loss, mouse_button_z_loss, mouse_delta_x_z_loss, mouse_delta_y_z_loss = (
+            self._calculate_z_loss(action_logits, masked_labels)
+        )
+        lb_loss = auxiliary_losses.get("lb_loss", action_logits.keys.new_zeros(()))
+        rz_loss = auxiliary_losses.get("rz_loss", action_logits.keys.new_zeros(()))
+        action_loss = (
+            (key_loss) / torch.log(torch.tensor(self.n_keyboard_choices))
+            + (mouse_button_loss) / torch.log(torch.tensor(self.n_mouse_button_choices))
+            + (mouse_delta_x_loss) / torch.log(torch.tensor(self.n_mouse_x_bins))
+            + (mouse_delta_y_loss) / torch.log(torch.tensor(self.n_mouse_y_bins))
+            + (
+                key_z_loss
+                + mouse_button_z_loss
+                + mouse_delta_x_z_loss
+                + mouse_delta_y_z_loss
+            )
+            * self.z_loss_weight
+            + lb_loss * self.lb_loss_weight
+            + rz_loss * self.rz_loss_weight
+        )
+        losses = {
+            "key": key_loss,
+            "mouse_button": mouse_button_loss,
+            "mouse_delta_x": mouse_delta_x_loss,
+            "mouse_delta_y": mouse_delta_y_loss,
+            "lb_loss": lb_loss,
+            "rz_loss": rz_loss,
+        }
+        return action_loss, losses
 
     def configure_optimizers(self):
         assert not self.inference_mode
@@ -1596,134 +1809,72 @@ class Stage3FutureVisionLightning(PolicyModelTrainer):
             logging.info(
                 f"First training step starting (compilation may take awhile). rank={self.trainer.global_rank}"
             )
-        
+            logging.info(
+                f"Future vision target mode: {self.future_vision_target_mode}"
+            )
+
         batch = self._apply_augmentations(batch)
         text_tokens_embed = batch.text_embeddings
-        
-        frames = self._normalize_frames(batch.frames)
-        batch_size = batch.frames.shape[0]
-        T = batch.frames.shape[1]
-        
-        # Create action inputs and masked labels (same as parent class)
+
+        # Keep label/mask construction in eager mode.
         with torch.no_grad():
             actions_in, masked_labels, ratio_unlabeled = (
                 self._create_target_and_masked_labels(batch)
             )
-        
-        action_embeddings_in = self.action_in_to_tokens(actions_in)
-        
-        # Get standard action prediction outputs with future vision prediction
-        action_out_embeddings, action_out_tokens, future_vision_pred, auxiliary_losses, auxiliary_outputs = (
-            self.transformer_forward_function(
-                frames,
-                action_embeddings_in,
-                text_tokens_embed,
+
+        @self.compile_mode
+        def _compiled_forward_and_future_loss(batch, actions_in, text_tokens_embed):
+            frames = self._normalize_frames(batch.frames)
+            batch_size = batch.frames.shape[0]
+            T = batch.frames.shape[1]
+            action_embeddings_in = self.action_in_to_tokens(actions_in)
+
+            action_out_embeddings, _, future_vision_pred, auxiliary_losses, auxiliary_outputs = (
+                self.transformer_forward_function(
+                    frames,
+                    action_embeddings_in,
+                    text_tokens_embed,
+                )
             )
-        )
-        
-        eager_assert(
-            action_out_embeddings.shape,
-            (
-                batch_size,
-                T,
-                self.n_actions,
-                self.config.policy_model.action_decoder.embed_dim,
-            ),
-        )
-        eager_assert(
-            future_vision_pred.shape,
-            (
-                batch_size,
-                T,
-                self.config.policy_model.transformer_dim,  # embed_dim
-            ),
+
+            eager_assert(
+                action_out_embeddings.shape,
+                (
+                    batch_size,
+                    T,
+                    self.n_actions,
+                    self.config.policy_model.action_decoder.embed_dim,
+                ),
+            )
+            eager_assert(
+                future_vision_pred.shape,
+                (
+                    batch_size,
+                    T,
+                    self.config.policy_model.transformer_dim,
+                ),
+            )
+
+            future_vision_target = self._build_state_target(
+                frames=frames,
+                future_vision_pred=future_vision_pred,
+            )
+            future_vision_loss = F.mse_loss(future_vision_pred, future_vision_target)
+
+            return action_out_embeddings, future_vision_loss, auxiliary_losses, auxiliary_outputs
+
+        action_out_embeddings, future_vision_loss, auxiliary_losses, auxiliary_outputs = (
+            _compiled_forward_and_future_loss(batch, actions_in, text_tokens_embed)
         )
 
-        # Compute action prediction loss (same as parent)
+        # Keep complex action CE/z-loss in eager mode to avoid over-fusion/compile failures.
         action_logits = self.action_out_tokens_to_logits(action_out_embeddings)
-        # masked_labels already created above from _create_target_and_masked_labels
-        
-        key_loss = F.cross_entropy(
-            input=action_logits.keys.view(-1, self.n_keyboard_choices),
-            target=masked_labels.keys.view(-1),
-            ignore_index=-100,
-        )
-        mouse_button_loss = F.cross_entropy(
-            input=action_logits.mouse_buttons.view(-1, self.n_mouse_button_choices),
-            target=masked_labels.mouse_buttons.view(-1),
-            ignore_index=-100,
-        )
-        mouse_delta_x_loss = F.cross_entropy(
-            input=action_logits.mouse_delta_x.view(-1, self.n_mouse_x_bins),
-            target=masked_labels.mouse_delta_x.view(-1),
-            ignore_index=-100,
-        )
-        mouse_delta_y_loss = F.cross_entropy(
-            input=action_logits.mouse_delta_y.view(-1, self.n_mouse_y_bins),
-            target=masked_labels.mouse_delta_y.view(-1),
-            ignore_index=-100,
+        action_loss, losses = self._calculate_action_loss_from_logits(
+            action_logits, masked_labels, auxiliary_losses
         )
 
-        # Compute future vision prediction loss
-        # future_vision_pred: [B, T, embed_dim] - 全局特征（单个向量）
-        # 我们的目标设计为：
-        #   - 对于 t < T-1：预测下一帧的全局视觉表征（frame_{t+1}）
-        #   - 对于 t = T-1：预测一个固定的 dummy 向量（全零），表示"未来未知/结束"
-        # 这样可以保证：
-        #   1. 每一帧都有未来预测任务（符合自回归/在线推理的直觉）
-        #   2. 不通过"最后一帧没有 loss"向模型泄露序列结束的位置
-        #   3. 前 T-1 帧的监督语义是干净的"next-frame prediction"
-
-        # 优化：批量处理所有未来帧，避免循环中多次调用 image_tokenizer
-        # 一次性处理 frames[:, 1:, :, :, :] (所有未来帧)
-        next_frames = frames[:, 1:, :, :, :]  # [B, T-1, C, H, W]
-        next_frames_tokens = self.image_tokenizer(next_frames)  # [B, T-1, n_img_tokens, embed_dim]
-        # 对空间维度求平均，得到全局特征
-        next_frames_global = next_frames_tokens.mean(dim=2)  # [B, T-1, embed_dim]
-        
-        # 创建最后一帧的 dummy 向量（全零）
-        dummy_global = torch.zeros_like(
-            future_vision_pred[:, 0:1, :]
-        )  # [B, 1, embed_dim]
-        
-        # 拼接：前 T-1 帧的真实未来特征 + 最后一帧的 dummy 向量
-        future_vision_target = torch.cat(
-            [next_frames_global, dummy_global], dim=1
-        )  # [B, T, embed_dim]
-        
-        future_vision_target = future_vision_target.detach()  # Don't backprop through image tokenizer
-
-        # Compute MSE loss between predicted and target global visual representations
-        future_vision_loss = F.mse_loss(
-            future_vision_pred,  # [B, T, embed_dim]
-            future_vision_target,  # [B, T, embed_dim]
-        )
-
-        # Combine losses
-        lb_loss = auxiliary_losses.get("lb_loss", torch.tensor(0.0))
-        rz_loss = auxiliary_losses.get("rz_loss", torch.tensor(0.0))
-        
-        key_z_loss, mouse_button_z_loss, mouse_delta_x_z_loss, mouse_delta_y_z_loss = (
-            self._calculate_z_loss(action_logits, masked_labels)
-        )
-        
-        action_loss = (
-            (key_loss) / torch.log(torch.tensor(self.n_keyboard_choices))
-            + (mouse_button_loss) / torch.log(torch.tensor(self.n_mouse_button_choices))
-            + (mouse_delta_x_loss) / torch.log(torch.tensor(self.n_mouse_x_bins))
-            + (mouse_delta_y_loss) / torch.log(torch.tensor(self.n_mouse_y_bins))
-            + (
-                key_z_loss
-                + mouse_button_z_loss
-                + mouse_delta_x_z_loss
-                + mouse_delta_y_z_loss
-            )
-            * self.z_loss_weight
-            + lb_loss * self.lb_loss_weight
-            + rz_loss * self.rz_loss_weight
-        )
-        
         total_loss = action_loss + self.future_vision_loss_weight * future_vision_loss
+        auxiliary_outputs["ratio_unlabeled"] = ratio_unlabeled
 
         if self.trainer.global_step == 0:
             logging.info(
@@ -1735,107 +1886,52 @@ class Stage3FutureVisionLightning(PolicyModelTrainer):
             self.log("train/loss_action", action_loss, on_step=True, on_epoch=True, sync_dist=True)
             self.log("train/loss_future_vision", future_vision_loss, on_step=True, on_epoch=True, sync_dist=True)
             self.log("train/loss_total", total_loss, on_step=True, on_epoch=True, sync_dist=True)
-            self.log("train/loss_key", key_loss, on_step=True, on_epoch=True, sync_dist=True)
-            self.log("train/loss_mouse_button", mouse_button_loss, on_step=True, on_epoch=True, sync_dist=True)
-            self.log("train/loss_mouse_delta_x", mouse_delta_x_loss, on_step=True, on_epoch=True, sync_dist=True)
-            self.log("train/loss_mouse_delta_y", mouse_delta_y_loss, on_step=True, on_epoch=True, sync_dist=True)
+            for loss_name, loss_value in losses.items():
+                self.log(
+                    f"train/loss_{loss_name}",
+                    loss_value,
+                    on_step=True,
+                    on_epoch=True,
+                    sync_dist=True,
+                )
 
         return total_loss
 
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
         """Validation step with future vision prediction."""
         text_tokens_embed = batch.text_embeddings
+        actions_in, masked_labels, _ = self._create_target_and_masked_labels(batch)
 
         @self.compile_mode
         def _compiled_validation_step(batch, text_tokens_embed):
-            actions_in, masked_labels, _ = self._create_target_and_masked_labels(batch)
-            
             frames = self._normalize_frames(batch.frames)
-            batch_size = batch.frames.shape[0]
-            T = batch.frames.shape[1]
             action_embeddings_in = self.action_in_to_tokens(actions_in)
-            
-            # PolicyFutureCausalTransformer returns 5 values
-            action_out_embeddings, action_out_tokens, future_vision_pred, auxiliary_losses, auxiliary_outputs = (
+
+            action_out_embeddings, _, future_vision_pred, auxiliary_losses, auxiliary_outputs = (
                 self.transformer_forward_function(
                     frames, action_embeddings_in, text_tokens_embed
                 )
             )
-            
-            # Compute action prediction loss
-            action_logits = self.action_out_tokens_to_logits(action_out_embeddings)
-            
-            key_loss = F.cross_entropy(
-                input=action_logits.keys.view(-1, self.n_keyboard_choices),
-                target=masked_labels.keys.view(-1),
-                ignore_index=-100,
-            )
-            mouse_button_loss = F.cross_entropy(
-                input=action_logits.mouse_buttons.view(-1, self.n_mouse_button_choices),
-                target=masked_labels.mouse_buttons.view(-1),
-                ignore_index=-100,
-            )
-            mouse_delta_x_loss = F.cross_entropy(
-                input=action_logits.mouse_delta_x.view(-1, self.n_mouse_x_bins),
-                target=masked_labels.mouse_delta_x.view(-1),
-                ignore_index=-100,
-            )
-            mouse_delta_y_loss = F.cross_entropy(
-                input=action_logits.mouse_delta_y.view(-1, self.n_mouse_y_bins),
-                target=masked_labels.mouse_delta_y.view(-1),
-                ignore_index=-100,
-            )
-            
-            # Compute future vision loss (same as training)
-            next_frames = frames[:, 1:, :, :, :]  # [B, T-1, C, H, W]
-            next_frames_tokens = self.image_tokenizer(next_frames)  # [B, T-1, n_img_tokens, embed_dim]
-            next_frames_global = next_frames_tokens.mean(dim=2)  # [B, T-1, embed_dim]
-            dummy_global = torch.zeros_like(future_vision_pred[:, 0:1, :])  # [B, 1, embed_dim]
-            future_vision_target = torch.cat([next_frames_global, dummy_global], dim=1)  # [B, T, embed_dim]
-            future_vision_target = future_vision_target.detach()
-            future_vision_loss = F.mse_loss(future_vision_pred, future_vision_target)
-            
-            # Combine losses
-            lb_loss = auxiliary_losses.get("lb_loss", torch.tensor(0.0))
-            rz_loss = auxiliary_losses.get("rz_loss", torch.tensor(0.0))
-            
-            key_z_loss, mouse_button_z_loss, mouse_delta_x_z_loss, mouse_delta_y_z_loss = (
-                self._calculate_z_loss(action_logits, masked_labels)
-            )
-            
-            action_loss = (
-                (key_loss) / torch.log(torch.tensor(self.n_keyboard_choices))
-                + (mouse_button_loss) / torch.log(torch.tensor(self.n_mouse_button_choices))
-                + (mouse_delta_x_loss) / torch.log(torch.tensor(self.n_mouse_x_bins))
-                + (mouse_delta_y_loss) / torch.log(torch.tensor(self.n_mouse_y_bins))
-                + (
-                    key_z_loss
-                    + mouse_button_z_loss
-                    + mouse_delta_x_z_loss
-                    + mouse_delta_y_z_loss
-                )
-                * self.z_loss_weight
-                + lb_loss * self.lb_loss_weight
-                + rz_loss * self.rz_loss_weight
-            )
-            
-            total_loss = action_loss + self.future_vision_loss_weight * future_vision_loss
-            
-            losses = {
-                "key": key_loss,
-                "mouse_button": mouse_button_loss,
-                "mouse_delta_x": mouse_delta_x_loss,
-                "mouse_delta_y": mouse_delta_y_loss,
-                "lb_loss": lb_loss,
-                "rz_loss": rz_loss,
-                "future_vision": future_vision_loss,
-            }
-            
-            return total_loss, losses, auxiliary_outputs
 
-        loss, losses, auxiliary_outputs = _compiled_validation_step(
+            future_vision_target = self._build_state_target(
+                frames=frames,
+                future_vision_pred=future_vision_pred,
+            )
+            future_vision_loss = F.mse_loss(future_vision_pred, future_vision_target)
+
+            return action_out_embeddings, future_vision_loss, auxiliary_losses, auxiliary_outputs
+
+        action_out_embeddings, future_vision_loss, auxiliary_losses, auxiliary_outputs = (
+            _compiled_validation_step(
             batch, text_tokens_embed
         )
+        )
+        action_logits = self.action_out_tokens_to_logits(action_out_embeddings)
+        action_loss, losses = self._calculate_action_loss_from_logits(
+            action_logits, masked_labels, auxiliary_losses
+        )
+        loss = action_loss + self.future_vision_loss_weight * future_vision_loss
+        losses["future_vision"] = future_vision_loss
         val_set_name = list(self.trainer.val_dataloaders.keys())[dataloader_idx]
         val_metrics = self._validation_metrics[val_set_name]
         val_metrics["perplexity"].update(cross_entropy_to_perplexity(loss))
@@ -1846,7 +1942,9 @@ class Stage3FutureVisionLightning(PolicyModelTrainer):
             cross_entropy_to_perplexity(losses["lb_loss"])
         )
         for k, v in losses.items():
-            val_metrics[f"perplexity_{k}"].update(cross_entropy_to_perplexity(v))
+            metric_key = f"perplexity_{k}"
+            if metric_key in val_metrics:
+                val_metrics[metric_key].update(cross_entropy_to_perplexity(v))
         for i in range(self.num_of_experts):
             val_metrics[f"expert_{i}_capacity"].update(
                 auxiliary_outputs["num_tokens_per_expert"][i]
@@ -2116,9 +2214,10 @@ def train_stage3_finetune(config: LightningPolicyConfig):
         # 如果配置中明确指定了checkpoint路径，使用它
         resume_checkpoint = config.stage3_finetune.init.stage3_model_path
         logging.info(f"Using checkpoint from config: {resume_checkpoint}")
-    else:
+    elif config.stage3_finetune.init.auto_resume_latest_checkpoint:
         # 自动查找checkpoint目录中的最新checkpoint
         import glob
+
         checkpoint_pattern = os.path.join(checkpoint_path, "checkpoint-step=*.ckpt")
         checkpoints = glob.glob(checkpoint_pattern)
         if checkpoints:
@@ -2128,6 +2227,8 @@ def train_stage3_finetune(config: LightningPolicyConfig):
             logging.info(f"Found latest checkpoint: {resume_checkpoint}")
         else:
             logging.info("No checkpoint found, starting training from scratch")
+    else:
+        logging.info("Auto resume disabled, starting training from scratch")
 
     async_checkpointer = AsyncCheckpointIO()
     checkpoint_callback = ModelCheckpoint(
@@ -2201,7 +2302,7 @@ def train_stage3_future_vision(config: LightningPolicyConfig):
 
     wandb_logger_kwargs = {
         "project": config.wandb.project,
-        "name": config.wandb.exp_name + "_stage3_future_vision",
+        "name": config.wandb.exp_name + "_stage3_vision",
         "version": run_id,
         "id": run_id,
         "log_model": False,
@@ -2229,7 +2330,7 @@ def train_stage3_future_vision(config: LightningPolicyConfig):
         # 如果配置中明确指定了checkpoint路径，使用它
         resume_checkpoint = config.stage3_finetune.init.stage3_model_path
         logging.info(f"Using checkpoint from config: {resume_checkpoint}")
-    else:
+    elif config.stage3_finetune.init.auto_resume_latest_checkpoint:
         # 自动查找checkpoint目录中的最新checkpoint
         import glob
 
@@ -2242,6 +2343,8 @@ def train_stage3_future_vision(config: LightningPolicyConfig):
             logging.info(f"Found latest checkpoint: {resume_checkpoint}")
         else:
             logging.info("No checkpoint found, starting training from scratch")
+    else:
+        logging.info("Auto resume disabled, starting training from scratch")
 
     async_checkpointer = AsyncCheckpointIO()
     checkpoint_callback = ModelCheckpoint(

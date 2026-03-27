@@ -119,6 +119,108 @@ def _img_policy_causal_mask(
     return _mask
 
 
+def _img_policy_future_causal_mask(
+    layer_idx: int,
+    n_img_tokens: int,
+    n_thinking_tokens: int,
+    n_action_tokens: int,
+    history_len: Optional[int] = None,
+    n_text_tokens: int = 0,
+    n_kv_sink_tokens: int = 0,
+):
+    """
+    Future-policy causal mask with two special output tokens per step:
+    [text, img, thinking, s0, a0, real_action_tokens...]
+    """
+
+    def _mask(b, h, q_idx, kv_idx):
+        is_sink = kv_idx < n_kv_sink_tokens
+        kv_idx_base = kv_idx - n_kv_sink_tokens
+
+        one_step_len = n_img_tokens + n_text_tokens + n_thinking_tokens + n_action_tokens
+        token_to_state_out = n_img_tokens + n_thinking_tokens + n_text_tokens
+        token_to_action_out = token_to_state_out + 1
+
+        def _step_and_img_mask(idx):
+            is_img_or_text_or_thinking = (idx % one_step_len) < token_to_state_out
+            step_idx = idx // one_step_len
+            return is_img_or_text_or_thinking, step_idx
+
+        def _step_and_state_out_mask(idx):
+            is_state_out = (idx % one_step_len) == token_to_state_out
+            step_idx = idx // one_step_len
+            return is_state_out, step_idx
+
+        def _step_and_action_out_mask(idx):
+            is_action_out = (idx % one_step_len) == token_to_action_out
+            step_idx = idx // one_step_len
+            return is_action_out, step_idx
+
+        def _step_and_real_action_mask(idx):
+            is_real_action = (idx % one_step_len) > token_to_action_out
+            step_idx = idx // one_step_len
+            return is_real_action, step_idx
+
+        q_is_img, q_step_idx = _step_and_img_mask(q_idx)
+        kv_is_img, kv_step_idx = _step_and_img_mask(kv_idx_base)
+        q_is_state_out, _ = _step_and_state_out_mask(q_idx)
+        kv_is_state_out, _ = _step_and_state_out_mask(kv_idx_base)
+        q_is_action_out, _ = _step_and_action_out_mask(q_idx)
+        kv_is_action_out, _ = _step_and_action_out_mask(kv_idx_base)
+        q_is_real_action, _ = _step_and_real_action_mask(q_idx)
+
+        full_mask = (
+            (
+                q_is_img
+                & ~kv_is_action_out
+                & ~kv_is_state_out
+                & (kv_step_idx < q_step_idx)
+            )
+            | (
+                q_is_state_out
+                & ~kv_is_action_out
+                & ~kv_is_state_out
+                & (kv_step_idx < q_step_idx)
+            )
+            | (
+                q_is_action_out
+                & ~kv_is_action_out
+                & ~kv_is_state_out
+                & (kv_step_idx < q_step_idx)
+            )
+            | (
+                q_is_real_action
+                & ~kv_is_action_out
+                & ~kv_is_state_out
+                & (kv_step_idx < q_step_idx)
+            )
+            | (q_is_img & kv_is_img & (kv_step_idx == q_step_idx))
+            | (
+                q_is_state_out
+                & (kv_is_img | kv_is_state_out)
+                & (kv_step_idx == q_step_idx)
+            )
+            | (
+                q_is_action_out
+                & (kv_is_img | kv_is_state_out | kv_is_action_out)
+                & (kv_step_idx == q_step_idx)
+            )
+            | (
+                q_is_real_action
+                & ~kv_is_action_out
+                & ~kv_is_state_out
+                & (kv_step_idx == q_step_idx)
+            )
+        )
+
+        if history_len is not None:
+            history_mask = (q_step_idx - kv_step_idx) <= history_len
+            full_mask = full_mask & history_mask
+        return is_sink | full_mask
+
+    return _mask
+
+
 class PolicyCausalTransformer(torch.nn.Module):
     def __init__(
         self,
@@ -737,23 +839,102 @@ class PolicyFutureCausalTransformer(PolicyCausalTransformer):
         mask_fn: Optional[Callable] = None,
         future_vision_loss_weight: float = 0.1,
     ):
+        if mask_fn is None:
+            mask_fn = _img_policy_future_causal_mask
         super().__init__(config, image_tokenizer, inference_mode, mask_fn)
-        
+
         self.future_vision_loss_weight = future_vision_loss_weight
-        
-        # Future vision prediction head: from a⁰ to next frame's global visual representation
-        # 输出全局特征（单个向量），用于监督 a⁰（全局动作决策 token）
-        # 使用全局特征（对 patch tokens 求平均）而不是 patch tokens，因为：
-        # 1. a⁰ 是全局决策 token，应该对应全局视觉表征
-        # 2. 语义匹配：全局 token 对应全局特征
-        # 3. 训练稳定：平均池化降低噪声影响
+        self.state_out_token = nn.Parameter(
+            torch.empty(1, 1, config.embed_dim, dtype=torch.bfloat16)
+        )
+        torch.nn.init.normal_(self.state_out_token, mean=0.0, std=self.embedding_std)
+
+        # Two output tokens per step in future mode: s0 + a0.
+        self.max_seq_len = (
+            self.image_tokenizer.get_n_img_tokens()
+            + self.text_token_size
+            + self.config.n_thinking_tokens
+            + 2
+            + self.config.n_action_tokens
+        ) * config.n_steps
+        self._transformer.max_seq_len = self.max_seq_len
+        self._transformer.rebuild_rope_cache(self.max_seq_len)
+        self.n_tokens_to_first_action = (
+            self.image_tokenizer.get_n_img_tokens()
+            + self.text_token_size
+            + self.config.n_thinking_tokens
+            + 2
+        )
+
+        output_action_token_idx = []
+        output_state_token_idx = []
+        for i in range(self.config.n_steps):
+            step_start_idx = i * (
+                self.image_tokenizer.get_n_img_tokens()
+                + self.text_token_size
+                + self.config.n_thinking_tokens
+                + 2
+                + self.config.n_action_tokens
+            )
+            state_idx = (
+                step_start_idx
+                + self.image_tokenizer.get_n_img_tokens()
+                + self.text_token_size
+                + self.config.n_thinking_tokens
+            )
+            output_state_token_idx.append(state_idx)
+            output_action_token_idx.append(state_idx + 1)
+
+        self.output_action_token_idx = torch.tensor(
+            output_action_token_idx, dtype=torch.long
+        )
+        self.register_buffer(
+            "output_state_token_idx",
+            torch.tensor(output_state_token_idx, dtype=torch.long),
+            persistent=False,
+        )
+        self._assign_layer_masks()
+
         self.future_vision_head = nn.Linear(
             config.embed_dim,
-            config.embed_dim,  # 直接输出 embed_dim，表示全局特征
+            config.embed_dim,
             bias=False,
         )
-        # Initialize with small weights
         torch.nn.init.normal_(self.future_vision_head.weight, mean=0.0, std=0.02)
+
+    def _assign_layer_masks(self):
+        assert len(self.config.attention_history_len) == len(
+            self._transformer.transformer_layers
+        ), "Number of transformer layers and list of attention n frames should match"
+        assert max(self.config.attention_history_len) == self.config.n_steps, (
+            "Max attention history len should be equal to the n_steps"
+        )
+        self._transformer._layer_mask_fns = []
+
+        for i, layer in enumerate(self._transformer.transformer_layers):
+            if not isinstance(layer, TransformerSelfAttentionLayer):
+                self._transformer._layer_mask_fns.append(None)
+                continue
+            allowed_frames = self.config.attention_history_len[i]
+            layer_mask_fn = self._mask_fn(
+                layer_idx=i,
+                n_img_tokens=self.image_tokenizer.get_n_img_tokens(),
+                n_thinking_tokens=self.config.n_thinking_tokens,
+                n_action_tokens=2 + self.config.n_action_tokens,
+                history_len=allowed_frames,
+                n_kv_sink_tokens=self.config.n_kv_sink_tokens,
+                n_text_tokens=self.text_token_size,
+            )
+            self._transformer._layer_mask_fns.append(layer_mask_fn)
+            layer.self_attention.block_mask = fa.create_block_mask(
+                layer_mask_fn,
+                B=None,
+                H=None,
+                Q_LEN=self.max_seq_len,
+                KV_LEN=self.max_seq_len + self.config.n_kv_sink_tokens,
+                BLOCK_SIZE=self.config.mask_block_size,
+                device=self.device,
+            )
 
     def forward(
         self,
@@ -763,34 +944,93 @@ class PolicyFutureCausalTransformer(PolicyCausalTransformer):
         should_grow_cache: bool = None,
         input_pos: Optional[torch.Tensor] = None,
     ):
-        """
-        output:
-        - action_out: (B, self.config.n_steps, self.config.embed_dim): the output actions embeddings
-        - action_out_tokens: (B, self.config.n_steps, self.config.embed_dim): the output of the starting action token embedding
-        - future_vision_pred: (B, self.config.n_steps, embed_dim): predicted global visual representation of next frame
-        - auxiliary_losses: auxiliary losses
-        - auxiliary_outputs: auxiliary outputs
-        """
-        # Call parent's forward to get action outputs
-        action_out, action_out_tokens, auxiliary_losses, auxiliary_outputs = super().forward(
-            img, action_embeddings_in, text_tokens_embed, should_grow_cache, input_pos
-        )
-        
-        # Predict future vision from action_out_tokens (a⁰)
-        # action_out_tokens: [B, n_steps, embed_dim]
-        # 输出全局特征（单个向量），用于监督 a⁰（全局动作决策 token）
-        future_vision_pred = self.future_vision_head(action_out_tokens)
-        # future_vision_pred: [B, n_steps, embed_dim]
-        
+        B, T, *_ = img.shape
+        img_tokens = self.image_tokenizer(img)
         eager_assert(
-            future_vision_pred.shape,
+            text_tokens_embed.shape,
             (
-                action_out_tokens.shape[0],
-                action_out_tokens.shape[1],
+                B,
+                T,
+                self.text_token_size,
+                self.text_tokenizer_embed_dim,
+            ),
+        )
+        eager_assert(
+            img_tokens.shape,
+            (
+                B,
+                T,
+                self.image_tokenizer.get_n_img_tokens(),
                 self.config.embed_dim,
             ),
         )
-        
+        eager_assert(
+            action_embeddings_in.shape,
+            (
+                B,
+                T,
+                self.config.n_action_tokens,
+                self.config.embed_dim,
+            ),
+        )
+        img_tokens_with_pos = img_tokens + self.img_pos_tokens.unsqueeze(0)
+        action_tokens_with_pos = action_embeddings_in + self.action_pos_tokens.unsqueeze(0)
+
+        text_tokens_embed = self.text_embed_mlp(text_tokens_embed)
+        text_tokens_embed = text_tokens_embed.reshape(
+            B * T, self.text_token_size, self.config.embed_dim
+        )
+        text_tokens_embed = self._impute_no_text_embedding(text_tokens_embed)
+        text_tokens_embed = text_tokens_embed.reshape(
+            B, T, self.text_token_size, self.config.embed_dim
+        )
+        text_embeddings_with_pos = text_tokens_embed + self.text_pos_tokens
+
+        x = []
+        batch_thinking_pos_tokens = self.thinking_pos_tokens.repeat(B, 1, 1)
+        batch_state_out_pos_token = self.state_out_token.repeat(B, 1, 1)
+        batch_action_out_pos_token = self.action_out_token.repeat(B, 1, 1)
+        for i in range(self.config.n_steps):
+            this_step_in = torch.cat(
+                [
+                    text_embeddings_with_pos[:, i],
+                    img_tokens_with_pos[:, i],
+                    batch_thinking_pos_tokens,
+                    batch_state_out_pos_token,
+                    batch_action_out_pos_token,
+                    action_tokens_with_pos[:, i],
+                ],
+                dim=1,
+            )
+            x.append(this_step_in)
+        x = torch.cat(x, dim=1)
+        eager_assert(x.shape, (B, self.max_seq_len, self.config.embed_dim))
+
+        y, _, auxiliary_losses, auxiliary_outputs = self._transformer.forward(
+            x, input_pos=input_pos, should_grow_cache=should_grow_cache
+        )
+        eager_assert(y.shape, (B, self.max_seq_len, self.config.embed_dim))
+
+        action_out_tokens = torch.index_select(
+            y, dim=1, index=self.output_action_token_idx
+        )
+        state_out_tokens = torch.index_select(
+            y, dim=1, index=self.output_state_token_idx
+        )
+
+        action_out = self.action_decoder(
+            action_embeddings_in=action_embeddings_in,
+            input_action_token=action_out_tokens,
+        )
+        future_vision_pred = self.future_vision_head(state_out_tokens)
+        eager_assert(
+            future_vision_pred.shape,
+            (
+                state_out_tokens.shape[0],
+                state_out_tokens.shape[1],
+                self.config.embed_dim,
+            ),
+        )
         return action_out, action_out_tokens, future_vision_pred, auxiliary_losses, auxiliary_outputs
 
     def online_forward(
@@ -805,34 +1045,10 @@ class PolicyFutureCausalTransformer(PolicyCausalTransformer):
         reshape_structured_action_fn: Callable = None,
         action_in_to_tokens_fn: Callable = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        This is forward pass with kv cache enabled, with future vision prediction.
-        
-        Returns:
-        - sampled_action: StructuredAction for current frame
-        - next_idx: next token index
-        - kv_cache_state: updated KV cache state
-        - future_vision_pred: predicted global visual representation of next frame [B, 1, embed_dim]
-        """
-        # Call parent's online_forward to get action
-        sampled_action, next_idx, kv_cache_state = super().online_forward(
-            img,
-            text_tokens_embed,
-            idx,
-            kv_cache_state,
-            should_grow_cache,
-            action_sampler,
-            empty_sampled_action_fn,
-            reshape_structured_action_fn,
-            action_in_to_tokens_fn,
-        )
-        
-        # Extract a⁰ for current frame to predict future vision
-        # We need to get action_out_token from the transformer output
         B, T, C, H, W = img.shape
         eager_assert(T, 1)
         eager_assert(B, 1)
-        
+
         img_tokens = self.image_tokenizer(img)
         img_tokens = img_tokens.view(
             B, self.image_tokenizer.get_n_img_tokens(), self.config.embed_dim
@@ -844,24 +1060,62 @@ class PolicyFutureCausalTransformer(PolicyCausalTransformer):
         text_tokens_embed = self.text_embed_mlp(text_tokens_embed)
         text_tokens_embed = self._impute_no_text_embedding(text_tokens_embed)
         text_tokens_embed_with_pos = text_tokens_embed + self.text_pos_tokens
-        
+
         input_pos = (
             torch.arange(
                 +self.image_tokenizer.get_n_img_tokens()
                 + self.text_token_size
                 + self.config.n_thinking_tokens
-                + 1
+                + 2
                 + self.config.n_action_tokens,
                 device=idx.device,
                 dtype=idx.dtype,
             )
             + idx
         )
-        
+
         batch_thinking_pos_tokens = self.thinking_pos_tokens.repeat(B, 1, 1)
+        batch_state_out_token = self.state_out_token.repeat(B, 1, 1)
         batch_action_out_token = self.action_out_token.repeat(B, 1, 1)
-        
-        # Use sampled action (already computed)
+        dummy_action_embeddings_in = torch.zeros(
+            B,
+            self.config.n_action_tokens,
+            self.config.embed_dim,
+            device=batch_action_out_token.device,
+        )
+        x = torch.cat(
+            [
+                text_tokens_embed_with_pos,
+                img_tokens_with_pos,
+                batch_thinking_pos_tokens,
+                batch_state_out_token,
+                batch_action_out_token,
+                dummy_action_embeddings_in,
+            ],
+            dim=1,
+        )
+        y, *_ = self._transformer.forward(
+            x,
+            input_pos=input_pos,
+            kv_cache_state=kv_cache_state,
+            should_grow_cache=should_grow_cache,
+            use_decode_mask=True,
+        )
+
+        action_out_position = (
+            self.image_tokenizer.get_n_img_tokens()
+            + self.text_token_size
+            + self.config.n_thinking_tokens
+            + 1
+        )
+        action_token_out = y[:, action_out_position : action_out_position + 1]
+        sampled_action = self.action_decoder.autogressive_sample(
+            action_token_out,
+            action_sampler,
+            empty_sampled_action_fn,
+            reshape_structured_action_fn,
+            inference_mode=True,
+        )
         sampled_action_reshaped = pytree.tree_map(
             lambda x: x.unsqueeze(0), sampled_action
         )
@@ -870,18 +1124,18 @@ class PolicyFutureCausalTransformer(PolicyCausalTransformer):
             B, self.config.n_action_tokens, self.config.embed_dim
         )
         action_embeddings_in_with_pos = action_embeddings_in + self.action_pos_tokens
-        
         x = torch.cat(
             [
                 text_tokens_embed_with_pos,
                 img_tokens_with_pos,
                 batch_thinking_pos_tokens,
+                batch_state_out_token,
                 batch_action_out_token,
                 action_embeddings_in_with_pos,
             ],
             dim=1,
         )
-        
+
         y_new, kv_cache_state, *_ = self._transformer.forward(
             x,
             input_pos=input_pos,
@@ -889,18 +1143,12 @@ class PolicyFutureCausalTransformer(PolicyCausalTransformer):
             should_grow_cache=should_grow_cache,
             use_decode_mask=True,
         )
-        
-        # Extract action_out_token (a⁰) from the output
-        action_out_position = (
+        next_idx = input_pos[-1] + 1
+        state_out_position = (
             self.image_tokenizer.get_n_img_tokens()
             + self.text_token_size
             + self.config.n_thinking_tokens
         )
-        action_token_out = y_new[:, action_out_position : action_out_position + 1]
-        # action_token_out: [B, 1, embed_dim]
-        
-        # Predict future vision (global feature)
-        future_vision_pred = self.future_vision_head(action_token_out)
-        # future_vision_pred: [B, 1, embed_dim]
-        
+        state_token_out = y_new[:, state_out_position : state_out_position + 1]
+        future_vision_pred = self.future_vision_head(state_token_out)
         return sampled_action, next_idx, kv_cache_state, future_vision_pred

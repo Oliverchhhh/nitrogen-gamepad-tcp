@@ -24,11 +24,14 @@ class VjepaTokenizerConfig(ConfigBase):
     checkpoint_path: Optional[str] = None
     
     # V-JEPA 2 模型架构名称
-    # 可选值：
+    # 可选值（V-JEPA 2.0）：
     #   - "vit_large": ViT-Large 模型（约 300M 参数，embed_dim=1024）
     #   - "vit_huge": ViT-Huge 模型（约 600M 参数，embed_dim=1280）
     #   - "vit_giant": ViT-Giant 模型（约 1.1B 参数，embed_dim=1408）
     #   - "vit_giant_384": ViT-Giant-384 模型（输入尺寸 384x384）
+    # 可选值（V-JEPA 2.1）：
+    #   - "vjepa2_1_vit_base_384"
+    #   - "vjepa2_1_vit_large_384"
     model_name: str = "vit_large"
     
     # 是否冻结 V-JEPA 2 的参数（不进行梯度更新）
@@ -62,6 +65,12 @@ class VjepaTokenizerConfig(ConfigBase):
     # 如果设置为 True，将从 torch.hub 下载预训练权重（需要网络连接）
     # 如果设置为 False，本地 checkpoint 不存在时会抛出错误
     use_hub_fallback: bool = False
+
+    # checkpoint 中 encoder 权重的 key
+    # - "auto": 自动检测（优先 ema_encoder，回退 encoder/target_encoder）
+    # - "ema_encoder": V-JEPA 2.1 常见 key
+    # - "encoder": V-JEPA 2.0 常见 key
+    checkpoint_key: str = "auto"
 
 
 class ImageTokenizerConfig(ConfigBase):

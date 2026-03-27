@@ -17,6 +17,7 @@ import json
 import uuid
 import shutil
 import subprocess
+import math
 from pathlib import Path
 from typing import Optional
 
@@ -34,6 +35,56 @@ def load_nitrogen_metadata(metadata_path: Path) -> dict:
 def load_nitrogen_actions(actions_path: Path) -> pd.DataFrame:
     """Load NitroGen actions from parquet file."""
     return pd.read_parquet(actions_path)
+
+
+def probe_video_frame_count(video_path: Path) -> Optional[int]:
+    """
+    Probe decodable frame count with ffprobe.
+
+    Returns:
+        int frame count if available, otherwise None.
+    """
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-count_frames",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=nb_read_frames,nb_frames,avg_frame_rate,duration",
+        "-of",
+        "json",
+        str(video_path),
+    ]
+    try:
+        out = subprocess.check_output(cmd, text=True)
+        streams = json.loads(out).get("streams", [])
+        if not streams:
+            return None
+        stream = streams[0]
+
+        # Preferred: decoded frame count.
+        nb_read_frames = stream.get("nb_read_frames")
+        if nb_read_frames not in (None, "N/A"):
+            return int(nb_read_frames)
+
+        # Fallback: container-reported frame count.
+        nb_frames = stream.get("nb_frames")
+        if nb_frames not in (None, "N/A"):
+            return int(nb_frames)
+
+        # Last fallback: duration * avg_frame_rate.
+        duration = stream.get("duration")
+        avg_fps = stream.get("avg_frame_rate")
+        if duration not in (None, "N/A") and avg_fps not in (None, "N/A", "0/0"):
+            num, den = avg_fps.split("/")
+            fps = float(num) / float(den)
+            return int(math.floor(float(duration) * fps + 1e-6))
+        return None
+    except Exception as e:
+        print(f"Warning: ffprobe frame count failed for {video_path}: {e}")
+        return None
 
 
 def find_column_by_pattern(columns: list, patterns: list) -> Optional[str]:
@@ -344,6 +395,7 @@ def convert_nitrogen_chunk(
     
     nitrogen_metadata = load_nitrogen_metadata(metadata_path)
     actions_df = load_nitrogen_actions(actions_path)
+    source_video_path: Optional[Path] = None
 
     # Generate deterministic sample name if not provided
     if sample_uuid is None:
@@ -358,6 +410,39 @@ def convert_nitrogen_chunk(
     print(f"  Chunk ID: {nitrogen_metadata['chunk_id']}")
     print(f"  Frames: {len(actions_df)}")
     print(f"  Actions columns: {actions_df.columns.tolist()}")
+
+    # Align annotation length with actual decodable video frame count.
+    try:
+        source_video_path = infer_source_video_path(
+            nitrogen_chunk_dir, nitrogen_metadata, video_root=video_root
+        )
+        video_frame_count = probe_video_frame_count(source_video_path)
+        if video_frame_count is not None:
+            action_count = len(actions_df)
+            aligned_count = min(video_frame_count, action_count)
+            if aligned_count != action_count:
+                print(
+                    "  Warning: frame mismatch detected. "
+                    f"actions={action_count}, video_decodable_frames={video_frame_count}. "
+                    f"Truncating annotations to {aligned_count}."
+                )
+                actions_df = actions_df.iloc[:aligned_count].reset_index(drop=True)
+            elif video_frame_count != action_count:
+                # This branch is logically unreachable with aligned_count==action_count unless equal,
+                # but keep explicit warning for readability if logic changes.
+                print(
+                    "  Warning: frame mismatch detected "
+                    f"(actions={action_count}, video_decodable_frames={video_frame_count})."
+                )
+            else:
+                print(f"  Frame check passed: actions={action_count}, video={video_frame_count}")
+        else:
+            print("  Warning: unable to probe decodable frame count, skip frame alignment.")
+    except Exception as e:
+        print(
+            "  Warning: failed to infer/probe source video for frame alignment "
+            f"({nitrogen_chunk_dir.name}): {e}"
+        )
     
     # Create VideoAnnotation proto
     video_annotation = create_video_annotation(
@@ -375,9 +460,10 @@ def convert_nitrogen_chunk(
     print(f"  Output directory: {output_dir}")
 
     if copy_video or generate_192:
-        source_video_path = infer_source_video_path(
-            nitrogen_chunk_dir, nitrogen_metadata, video_root=video_root
-        )
+        if source_video_path is None:
+            source_video_path = infer_source_video_path(
+                nitrogen_chunk_dir, nitrogen_metadata, video_root=video_root
+            )
         target_video_path = output_dir / "video.mp4"
         if overwrite or not target_video_path.exists():
             shutil.copy2(source_video_path, target_video_path)

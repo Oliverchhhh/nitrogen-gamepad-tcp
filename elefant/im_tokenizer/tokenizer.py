@@ -165,43 +165,30 @@ class Vjepa2Tokenizer(ImageBaseTokenizer):
         # ========================================================================
         # 导入 vjepa2 相关模块（延迟导入，避免依赖问题）
         # ========================================================================
-        try:
-            import sys
-            from pathlib import Path
-            import os
-            
-            # 尝试从环境变量或默认路径添加 vjepa2 项目路径
-            vjepa2_path = os.getenv("VJEPA2_PATH")
-            if vjepa2_path is None:
-                # 默认路径（Windows）
-                vjepa2_path = Path("D:/project/vjepa2")
-                # 如果不存在，尝试 Linux 路径
-                if not vjepa2_path.exists():
-                    vjepa2_path = Path("/mnt/d/project/vjepa2")
-            else:
-                vjepa2_path = Path(vjepa2_path)
-            
-            if vjepa2_path.exists():
-                sys.path.insert(0, str(vjepa2_path))
-                logging.info(f"已添加 vjepa2 路径到 sys.path: {vjepa2_path}")
-            else:
-                logging.warning(f"vjepa2 路径不存在: {vjepa2_path}，尝试直接导入（可能需要安装 vjepa2 包）")
-            
-            from src.hub.backbones import (
-                vjepa2_vit_large,
-                vjepa2_vit_huge,
-                vjepa2_vit_giant,
-                vjepa2_vit_giant_384,
-            )
-            from src.models import vision_transformer as vit_encoder
-            from src.models import predictor as vit_predictor
-        except ImportError as e:
-            raise ImportError(
-                f"无法导入 vjepa2 模块。请确保：\n"
-                f"1. vjepa2 项目在正确的位置（可通过环境变量 VJEPA2_PATH 设置）\n"
-                f"2. 或者已安装 vjepa2 包\n"
-                f"错误: {e}"
-            )
+        import sys
+        from pathlib import Path
+
+        # 尝试从环境变量或默认路径添加 vjepa2 项目路径
+        vjepa2_path = os.getenv("VJEPA2_PATH")
+        if vjepa2_path is None:
+            # 默认：项目内 third_party/vjepa2，其次回退到常见本地路径
+            candidate_paths = [
+                Path(__file__).resolve().parents[2] / "third_party" / "vjepa2",
+                Path(__file__).resolve().parents[2] / "third_part" / "vjepa2",
+                Path("D:/project/vjepa2"),
+                Path("/mnt/d/project/vjepa2"),
+            ]
+            for p in candidate_paths:
+                if p.exists():
+                    vjepa2_path = str(p)
+                    break
+
+        if vjepa2_path and Path(vjepa2_path).exists():
+            if vjepa2_path not in sys.path:
+                sys.path.insert(0, vjepa2_path)
+            logging.info(f"已添加 vjepa2 路径到 sys.path: {vjepa2_path}")
+        else:
+            logging.warning("vjepa2 路径不存在，尝试直接导入")
         
         # 存储配置
         self.vjepa_config = vjepa_config
@@ -211,16 +198,11 @@ class Vjepa2Tokenizer(ImageBaseTokenizer):
         self.tubelet_size = vjepa_config.tubelet_size
         self.patch_size = vjepa_config.patch_size
         
-        # 加载 V-JEPA 2 encoder
-        self.encoder = self._load_vjepa_model(
-            vjepa_config,
-            vjepa2_vit_large,
-            vjepa2_vit_huge,
-            vjepa2_vit_giant,
-            vjepa2_vit_giant_384,
-            vit_encoder,
-            vit_predictor,
-        )
+        # 判断是否为 V-JEPA 2.1 模型
+        self._is_vjepa21 = vjepa_config.model_name.startswith("vjepa2_1_")
+
+        # 加载 V-JEPA 2 / 2.1 encoder
+        self.encoder = self._load_vjepa_model(vjepa_config)
         
         # 设置冻结模式
         if vjepa_config.frozen:
@@ -248,154 +230,113 @@ class Vjepa2Tokenizer(ImageBaseTokenizer):
         # 存储 vjepa_embed_dim 供 forward 使用
         self.vjepa_embed_dim = vjepa_embed_dim
     
-    def _load_vjepa_model(
-        self,
-        config,
-        vjepa2_vit_large,
-        vjepa2_vit_huge,
-        vjepa2_vit_giant,
-        vjepa2_vit_giant_384,
-        vit_encoder,
-        vit_predictor,
-    ):
-        """
-        加载 V-JEPA 2 模型（优先使用本地 checkpoint）
-        
-        加载策略：
-        1. 优先使用本地 checkpoint（如果 checkpoint_path 存在）
-        2. 如果本地不存在且 use_hub_fallback=True，从 torch.hub 下载
-        3. 否则抛出错误
-        
-        Args:
-            config: VjepaTokenizerConfig 配置对象
-            vjepa2_vit_*: 各种模型架构的加载函数
-            vit_encoder: Vision Transformer 编码器模块
-            vit_predictor: Predictor 模块（用于加载 checkpoint）
-        
-        Returns:
-            encoder: V-JEPA 2 编码器模型
-        """
-        import os
-        import torch
-        
-        # 模型名称到架构名称和加载函数的映射
-        model_map = {
-            "vit_large": ("vit_large", vjepa2_vit_large),
-            "vit_huge": ("vit_huge", vjepa2_vit_huge),
-            "vit_giant": ("vit_giant", vjepa2_vit_giant),
-            "vit_giant_384": ("vit_giant_384", vjepa2_vit_giant_384),
-        }
-        
-        # 检查模型名称是否支持
-        if config.model_name not in model_map:
-            raise ValueError(
-                f"不支持的 model_name: {config.model_name}。"
-                f"支持的值: {list(model_map.keys())}"
-            )
-        
-        arch_name, hub_func = model_map[config.model_name]
-        
-        # ========================================================================
-        # 优先使用本地 checkpoint
-        # ========================================================================
+    def _load_vjepa_model(self, config):
+        """加载 V-JEPA 2/2.1 模型（优先本地 checkpoint）。"""
         checkpoint_path = config.checkpoint_path
         if checkpoint_path and os.path.exists(checkpoint_path):
-            logging.info(f"从本地 checkpoint 加载 V-JEPA 2: {checkpoint_path}")
-            encoder, predictor = self._load_from_checkpoint(
-                checkpoint_path, arch_name, config, vit_encoder, vit_predictor
+            logging.info(f"从本地 checkpoint 加载 V-JEPA: {checkpoint_path}")
+            return self._load_from_checkpoint(checkpoint_path, config)
+        if config.use_hub_fallback:
+            logging.info(f"从 torch.hub 加载 V-JEPA: {config.model_name}")
+            return self._load_via_hub(config)
+        raise ValueError(
+            f"未找到本地 checkpoint ({checkpoint_path})，且 use_hub_fallback=False。"
+            "请设置 checkpoint_path 或 use_hub_fallback=True"
+        )
+
+    def _load_via_hub(self, config):
+        """通过 hub 函数加载模型。"""
+        if self._is_vjepa21:
+            from src.hub.backbones import (
+                vjepa2_1_vit_base_384,
+                vjepa2_1_vit_large_384,
             )
-            return encoder
-        # ========================================================================
-        # 后备方案：从 torch.hub 下载
-        # ========================================================================
-        elif config.use_hub_fallback:
-            logging.info(f"从 torch.hub 加载 V-JEPA 2: {config.model_name}")
-            encoder, predictor = hub_func(pretrained=True, **self._get_model_kwargs(config))
-            return encoder
+
+            hub_map = {
+                "vjepa2_1_vit_base_384": vjepa2_1_vit_base_384,
+                "vjepa2_1_vit_large_384": vjepa2_1_vit_large_384,
+            }
         else:
-            raise ValueError(
-                f"未找到本地 checkpoint ({checkpoint_path})，且 use_hub_fallback=False。"
-                f"请设置 checkpoint_path 或 use_hub_fallback=True"
+            from src.hub.backbones import (
+                vjepa2_vit_large,
+                vjepa2_vit_huge,
+                vjepa2_vit_giant,
+                vjepa2_vit_giant_384,
             )
-    
-    def _load_from_checkpoint(self, checkpoint_path, arch_name, config, vit_encoder, vit_predictor):
-        """
-        从本地 checkpoint 文件加载模型权重
-        
-        V-JEPA 2 的 checkpoint 文件包含 encoder 和 predictor 两部分权重。
-        我们只需要 encoder 部分，但为了完整性也会加载 predictor（虽然不使用）。
-        
-        Args:
-            checkpoint_path: checkpoint 文件路径
-            arch_name: 模型架构名称（如 "vit_large"）
-            config: VjepaTokenizerConfig 配置对象
-            vit_encoder: Vision Transformer 编码器模块
-            vit_predictor: Predictor 模块
-        
-        Returns:
-            encoder: 加载了权重的编码器
-            predictor: 加载了权重的 predictor（未使用）
-        """
-        import torch
-        
-        # ========================================================================
-        # 清理 state_dict key 的函数
-        # ========================================================================
-        # V-JEPA 2 的 checkpoint 可能包含 "module." 或 "backbone." 前缀（来自 DDP 训练）
-        # 需要清理这些前缀以匹配模型定义中的 key
+
+            hub_map = {
+                "vit_large": vjepa2_vit_large,
+                "vit_huge": vjepa2_vit_huge,
+                "vit_giant": vjepa2_vit_giant,
+                "vit_giant_384": vjepa2_vit_giant_384,
+            }
+
+        if config.model_name not in hub_map:
+            raise ValueError(
+                f"不支持的 model_name: {config.model_name}。"
+                f"支持的值: {list(hub_map.keys())}"
+            )
+
+        encoder, _ = hub_map[config.model_name](pretrained=True)
+        return encoder
+
+    def _resolve_checkpoint_key(self, checkpoint, config):
+        """自动解析 checkpoint 中 encoder 权重 key。"""
+        if config.checkpoint_key != "auto":
+            return config.checkpoint_key
+
+        for candidate in ["ema_encoder", "encoder", "target_encoder"]:
+            if candidate in checkpoint:
+                logging.info(f"自动检测到 checkpoint key: {candidate}")
+                return candidate
+
+        raise KeyError(f"checkpoint 中未找到 encoder 权重，可用 keys: {list(checkpoint.keys())}")
+
+    def _load_from_checkpoint(self, checkpoint_path, config):
+        """从本地 checkpoint 文件加载模型权重。"""
+
         def _clean_backbone_key(state_dict):
             cleaned = {}
             for key, val in state_dict.items():
-                # 移除 "module." 前缀（来自 DataParallel 或 DistributedDataParallel）
-                # 移除 "backbone." 前缀（来自某些训练脚本的命名）
                 new_key = key.replace("module.", "").replace("backbone.", "")
                 cleaned[new_key] = val
             return cleaned
-        
-        # ========================================================================
-        # 创建模型结构
-        # ========================================================================
-        # 创建 encoder（我们实际使用的部分）
-        encoder_kwargs = self._get_model_kwargs(config)
-        encoder = vit_encoder.__dict__[arch_name](**encoder_kwargs)
-        
-        # 创建 predictor（虽然我们只用 encoder，但 checkpoint 里包含 predictor）
-        # 为了能够正确加载 checkpoint，我们也需要创建 predictor 结构
-        predictor_kwargs = dict(
-            img_size=(config.img_size, config.img_size),
-            patch_size=config.patch_size,
-            use_mask_tokens=True,
-            embed_dim=encoder.embed_dim,  # 使用 encoder 的 embed_dim
-            predictor_embed_dim=384,      # Predictor 的 embedding 维度
-            num_frames=config.num_frames,
-            tubelet_size=config.tubelet_size,
-            depth=12,                     # Predictor 的深度
-            num_heads=12,                 # Predictor 的注意力头数
-            num_mask_tokens=10,           # Mask token 数量
-            use_rope=True,                # 使用 RoPE 位置编码
-            uniform_power=False,
-            use_sdpa=True,                # 使用 Scaled Dot Product Attention
-            use_silu=False,
-            wide_silu=True,
-        )
-        predictor = vit_predictor.__dict__["vit_predictor"](**predictor_kwargs)
-        
-        # ========================================================================
-        # 加载权重
-        # ========================================================================
-        # 加载 checkpoint 文件（使用 weights_only=True 提高安全性）
-        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
-        
-        # 加载 encoder 权重（这是我们实际需要的）
-        encoder_state_dict = _clean_backbone_key(checkpoint["encoder"])
-        encoder.load_state_dict(encoder_state_dict, strict=False)  # strict=False 允许部分匹配
-        
-        # predictor 权重我们不需要，但为了完整性也加载（避免警告）
-        predictor_state_dict = _clean_backbone_key(checkpoint.get("predictor", {}))
-        if predictor_state_dict:
-            predictor.load_state_dict(predictor_state_dict, strict=False)
-        
-        return encoder, predictor
+
+        # 创建 encoder 结构
+        if self._is_vjepa21:
+            from app.vjepa_2_1.models import vision_transformer as vit_encoder
+            from src.hub.backbones import ARCH_NAME_MAP
+
+            arch_name = ARCH_NAME_MAP[config.model_name][0]
+            encoder = vit_encoder.__dict__[arch_name](**self._get_model_kwargs(config))
+        else:
+            from src.models import vision_transformer as vit_encoder
+
+            model_map = {
+                "vit_large": "vit_large",
+                "vit_huge": "vit_huge",
+                "vit_giant": "vit_giant_xformers",
+                "vit_giant_384": "vit_giant_xformers",
+            }
+            if config.model_name not in model_map:
+                raise ValueError(
+                    f"不支持的 model_name: {config.model_name}。"
+                    f"支持的值: {list(model_map.keys())}"
+                )
+            arch_name = model_map[config.model_name]
+            encoder = vit_encoder.__dict__[arch_name](**self._get_model_kwargs(config))
+
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        ckpt_key = self._resolve_checkpoint_key(checkpoint, config)
+        encoder_state_dict = _clean_backbone_key(checkpoint[ckpt_key])
+
+        msg = encoder.load_state_dict(encoder_state_dict, strict=False)
+        if msg.missing_keys:
+            logging.warning(f"Encoder missing keys: {msg.missing_keys}")
+        if msg.unexpected_keys:
+            logging.warning(f"Encoder unexpected keys: {msg.unexpected_keys}")
+
+        return encoder
     
     def _get_model_kwargs(self, config):
         """
@@ -410,7 +351,7 @@ class Vjepa2Tokenizer(ImageBaseTokenizer):
         Returns:
             dict: 模型初始化参数字典
         """
-        return dict(
+        kwargs = dict(
             img_size=(config.img_size, config.img_size),  # 输入图像尺寸
             patch_size=config.patch_size,                  # 空间 patch 大小
             num_frames=config.num_frames,                   # 预训练时使用的帧数
@@ -421,6 +362,10 @@ class Vjepa2Tokenizer(ImageBaseTokenizer):
             uniform_power=False,                           # 不使用均匀功率的位置编码
             use_rope=True,                                 # 使用 RoPE（Rotary Position Embedding）位置编码
         )
+        if self._is_vjepa21:
+            kwargs["img_temporal_dim_size"] = 1
+            kwargs["interpolate_rope"] = True
+        return kwargs
     
     def get_n_img_tokens(self) -> int:
         """
