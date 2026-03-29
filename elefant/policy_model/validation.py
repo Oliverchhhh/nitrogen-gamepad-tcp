@@ -21,6 +21,7 @@ from elefant.policy_model.config import LightningPolicyConfig
 from elefant.policy_model.stage3_finetune import (
     Stage3DataModule,
     Stage3LabelledBCLightning,
+    Stage3FutureVisionLightning,
 )
 from elefant.data import ActionLabelVideoDatasetItem, StructuredAction
 from elefant.metrics import LossMetric
@@ -33,12 +34,15 @@ def move_action_label_video_dataset_item_to_device(
     """Moves the tensors within an ActionLabelVideoDatasetItem to the specified device and dtype."""
     moved_frames = batch.frames.to(device)
 
-    moved_action_annotations = StructuredAction(
-        keys=batch.action_annotations.keys.to(device),
-        mouse_buttons=batch.action_annotations.mouse_buttons.to(device),
-        mouse_delta_x=batch.action_annotations.mouse_delta_x.to(device),
-        mouse_delta_y=batch.action_annotations.mouse_delta_y.to(device),
-    )
+    if isinstance(batch.action_annotations, torch.Tensor):
+        moved_action_annotations = batch.action_annotations.to(device)
+    else:
+        moved_action_annotations = StructuredAction(
+            keys=batch.action_annotations.keys.to(device),
+            mouse_buttons=batch.action_annotations.mouse_buttons.to(device),
+            mouse_delta_x=batch.action_annotations.mouse_delta_x.to(device),
+            mouse_delta_y=batch.action_annotations.mouse_delta_y.to(device),
+        )
     moved_env_subenv_encoding = batch.env_subenv_encoding.to(device)
     moved_user_action_mask = batch.user_action_mask.to(device)
     moved_system_action_mask = batch.system_action_mask.to(device)
@@ -90,6 +94,86 @@ def set_validation_dataset_cfg_to_single_thread(validation_dataset_cfgs, batch_s
     return validation_dataset_cfgs
 
 
+def _is_future_vision_model(config: LightningPolicyConfig) -> bool:
+    return config.stage3_finetune.state_target_tokenizer is not None
+
+
+def _load_validation_model(checkpoint_path: str, config: LightningPolicyConfig):
+    if _is_future_vision_model(config):
+        logging.info("Loading Stage3FutureVisionLightning for validation")
+        model = Stage3FutureVisionLightning(
+            config=config,
+            inference_mode=True,
+        )
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        incompatible_keys = model.load_state_dict(
+            checkpoint["state_dict"], strict=False
+        )
+
+        missing_keys = list(incompatible_keys.missing_keys)
+        unexpected_keys = list(incompatible_keys.unexpected_keys)
+        allowed_missing_prefixes = ("state_target_tokenizer.",)
+        disallowed_missing_keys = [
+            key
+            for key in missing_keys
+            if not key.startswith(allowed_missing_prefixes)
+        ]
+
+        if missing_keys:
+            logging.warning("Missing keys while loading future vision model: %s", missing_keys)
+        if unexpected_keys:
+            logging.warning(
+                "Unexpected keys while loading future vision model: %s",
+                unexpected_keys,
+            )
+
+        if disallowed_missing_keys or unexpected_keys:
+            raise RuntimeError(
+                "Unexpected checkpoint incompatibility for Stage3FutureVisionLightning. "
+                f"disallowed_missing_keys={disallowed_missing_keys}, "
+                f"unexpected_keys={unexpected_keys}"
+            )
+        return model
+
+    logging.info("Loading Stage3LabelledBCLightning for validation")
+    return Stage3LabelledBCLightning.load_from_checkpoint(
+        checkpoint_path, config=config, inference_mode=True
+    )
+
+
+def _calculate_validation_loss(model, batch_to_cuda, actions_in, masked_labels):
+    if isinstance(model, Stage3FutureVisionLightning):
+        frames = model._normalize_frames(batch_to_cuda.frames)
+        action_embeddings_in = model.action_in_to_tokens(actions_in)
+        action_out_embeddings, _, future_vision_pred, auxiliary_losses, auxiliary_outputs = (
+            model.transformer_forward_function(
+                frames, action_embeddings_in, batch_to_cuda.text_embeddings
+            )
+        )
+        future_vision_target = model._build_state_target(
+            frames=frames,
+            future_vision_pred=future_vision_pred,
+        )
+        future_vision_loss = torch.nn.functional.mse_loss(
+            future_vision_pred, future_vision_target
+        )
+        action_logits = model.action_out_tokens_to_logits(action_out_embeddings)
+        action_loss, losses = model._calculate_action_loss_from_logits(
+            action_logits, masked_labels, auxiliary_losses
+        )
+        loss = action_loss + model.future_vision_loss_weight * future_vision_loss
+        losses["future_vision"] = future_vision_loss
+        return loss, losses, auxiliary_outputs
+
+    loss, _, losses, auxiliary_outputs = model._calculate_loss(
+        batch_to_cuda,
+        actions_in,
+        masked_labels,
+        batch_to_cuda.text_embeddings,
+    )
+    return loss, losses, auxiliary_outputs
+
+
 def report_validation_metrics(
     checkpoint_path: str, config_path: str, global_step: int, run_id: str
 ):
@@ -125,9 +209,7 @@ def report_validation_metrics(
                     BATCH_SIZE_FOR_VAL,
                 )
             )
-        model = Stage3LabelledBCLightning.load_from_checkpoint(
-            checkpoint_path, config=config, inference_mode=True
-        )
+        model = _load_validation_model(checkpoint_path, config)
         batch_size = max(
             [v.batch_size for v in config.stage3_finetune.validation_datasets],
             default=1,
@@ -180,11 +262,11 @@ def report_validation_metrics(
                     torch.inference_mode(),
                     torch.autocast(device_type="cuda", dtype=torch.bfloat16),
                 ):
-                    loss, _, losses, auxiliary_outputs = model._calculate_loss(
+                    loss, losses, auxiliary_outputs = _calculate_validation_loss(
+                        model,
                         batch_to_cuda,
                         actions_in,
                         masked_labels,
-                        batch_to_cuda.text_embeddings,
                     )
 
                 if torch.isnan(loss):

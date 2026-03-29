@@ -401,7 +401,9 @@ class VideoProtoDataset(torch.utils.data.IterableDataset, ABC):
         self._protos = sorted(
             [
                 os.path.join(root, f)
-                for root, _, files in os.walk(self.config.local_prefix)
+                for root, _, files in os.walk(
+                    self.config.local_prefix, followlinks=True
+                )
                 for f in files
                 if f.endswith(".proto")
             ]

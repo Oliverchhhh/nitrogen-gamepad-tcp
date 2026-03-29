@@ -28,6 +28,7 @@ from elefant.data.action_mapping import (
 import elefant.data.proto.video_inference_pb2 as video_inference_pb2
 from elefant.policy_model.stage3_finetune import (
     Stage3LabelledBCLightning,
+    Stage3FutureVisionLightning,
     count_model_parameters,
 )
 from elefant.torch import pytorch_setup
@@ -617,12 +618,44 @@ class InferenceServer(UnixDomainSocketInferenceServer):
                         config=config, inference_mode=True
                     ).to(device="cuda", dtype=torch.bfloat16)
                 else:
-                    # Load model from checkpoint
-                    self.model = Stage3LabelledBCLightning.load_from_checkpoint(
-                        checkpoint_path,
-                        config=config,
-                        inference_mode=True,
+                    # Load model from checkpoint, auto-selecting class
+                    is_future_vision = (
+                        config.stage3_finetune.state_target_tokenizer is not None
                     )
+                    if is_future_vision:
+                        logging.info(
+                            "Detected future vision config, loading Stage3FutureVisionLightning"
+                        )
+                        self.model = Stage3FutureVisionLightning(
+                            config=config, inference_mode=True
+                        )
+                        ckpt = torch.load(
+                            checkpoint_path, map_location="cpu", weights_only=False
+                        )
+                        incompatible = self.model.load_state_dict(
+                            ckpt["state_dict"], strict=False
+                        )
+                        disallowed_missing = [
+                            k
+                            for k in incompatible.missing_keys
+                            if not k.startswith("state_target_tokenizer.")
+                        ]
+                        if disallowed_missing or incompatible.unexpected_keys:
+                            raise RuntimeError(
+                                "Checkpoint incompatibility for Stage3FutureVisionLightning. "
+                                f"disallowed_missing={disallowed_missing}, "
+                                f"unexpected={list(incompatible.unexpected_keys)}"
+                            )
+                        if incompatible.missing_keys:
+                            logging.warning(
+                                "Ignored missing state_target_tokenizer keys (frozen, not needed for inference)"
+                            )
+                    else:
+                        self.model = Stage3LabelledBCLightning.load_from_checkpoint(
+                            checkpoint_path,
+                            config=config,
+                            inference_mode=True,
+                        )
         total_params, expert_params = count_model_parameters(self.model)
         logging.info(
             f"Total parameters: {total_params}, Expert parameters: {expert_params}"
