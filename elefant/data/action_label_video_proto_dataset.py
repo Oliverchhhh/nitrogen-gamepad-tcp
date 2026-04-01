@@ -70,9 +70,19 @@ class ActionLabelAnnotationParser(ProtoParser):
         if self.frame_annotations is not None:
             if len(self.frame_annotations) != n_frames and n_frames != -1:
                 if always_labelled:
-                    raise ValueError(
-                        f"Number of frames in the proto ({len(self.frame_annotations)}) does not match the number of frames in the dataset ({n_frames})"
-                    )
+                    if len(self.frame_annotations) > n_frames:
+                        # proto 多于视频：严格错误，不应该发生
+                        raise ValueError(
+                            f"Number of frames in the proto ({len(self.frame_annotations)}) is greater than "
+                            f"the number of frames in the video ({n_frames}). "
+                            f"Proto should have been truncated during dataset assembly."
+                        )
+                    else:
+                        # 视频多于 proto（常见于 chunk_0000 多 1-3 帧）：安全，多余视频帧会被忽略
+                        logging.info(
+                            f"Video has {n_frames} frames but proto has {len(self.frame_annotations)} annotations. "
+                            f"Extra video frames will be ignored."
+                        )
                 else:
                     # we have some legacy unlabelled data that has more annotations than frames, that's fine because all the annotations will be rewritten during training
                     logging.debug(

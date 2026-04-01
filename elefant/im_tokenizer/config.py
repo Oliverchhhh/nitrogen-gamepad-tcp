@@ -73,6 +73,52 @@ class VjepaTokenizerConfig(ConfigBase):
     checkpoint_key: str = "auto"
 
 
+class StaMoTokenizerConfig(ConfigBase):
+    """
+    StaMo Tokenizer 配置类
+
+    StaMo 使用 timm ViT backbone + Q-Former 式 Projector 将单帧图像压缩为极少量 token。
+    论文: "StaMo: Unsupervised Learning of Generalizable Robotic Motions from Static Images"
+    """
+    # timm ViT backbone 模型名称
+    model_name: str = "vit_base_patch14_reg4_dinov2.lvd142m"
+
+    # 本地 backbone 权重路径（如果为 None 则使用 timm 在线下载）
+    backbone_local_ckpt: Optional[str] = None
+
+    # 是否使用 timm pretrained 权重（当 backbone_local_ckpt 为 None 时生效）
+    backbone_pretrained: bool = True
+
+    # Projector checkpoint 路径（包含训练好的 Projector 权重）
+    # 如果为 None，则 Projector 使用随机初始化（仅用于测试）
+    projector_ckpt: Optional[str] = None
+
+    # 输入图像尺寸
+    img_size: int = 224
+
+    # 是否冻结全部参数（backbone + projector）
+    frozen: bool = True
+
+    # ---- Projector 超参 ----
+    # 压缩后的 token 数量（StaMo 默认 2）
+    num_token: int = 2
+
+    # Projector 中 self+cross attn 层数
+    num_attn_layers: int = 6
+
+    # Projector 中逐级压缩 attn 层数
+    num_attn_compress_layers: int = 6
+
+    # Projector 内部隐藏维度
+    hidden_dim: int = 1024
+
+    # Projector cross-attention 维度
+    cross_attention_dim: int = 512
+
+    # Projector 输出对齐维度（最终每个 token 的特征维度）
+    output_align_dim: int = 4096
+
+
 class ImageTokenizerConfig(ConfigBase):
     type: str = "vit"
     conv_tokenizer_config: Optional[ConvTokenizerConfig] = pydantic.Field(
@@ -82,5 +128,8 @@ class ImageTokenizerConfig(ConfigBase):
         default=VitTokenizerConfig()
     )
     vjepa_tokenizer_config: Optional[VjepaTokenizerConfig] = pydantic.Field(
+        default=None
+    )
+    stamo_tokenizer_config: Optional[StaMoTokenizerConfig] = pydantic.Field(
         default=None
     )

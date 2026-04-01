@@ -497,7 +497,7 @@ class PolicyModelTrainer(ModelFreePolicy):
             ):
                 cache_is_full = True
 
-            sampled_action, idx, kv_cache_state = self.bc_transformer.online_forward(
+            sampled_action, idx, kv_cache_state, *_ = self.bc_transformer.online_forward(
                 frame,
                 text_tokens_embed=text_tokens_embed,
                 idx=idx,
@@ -2042,6 +2042,7 @@ class SupervisedDataModule(pl.LightningDataModule):
                 frame_height=self.cfg.shared.frame_height,
                 frame_width=self.cfg.shared.frame_width,
                 local_prefix=self.training_dataset_cfg.local_prefix,
+                load_video_name=self.training_dataset_cfg.load_video_name,
                 shuffle=True,
                 T=self.cfg.shared.n_seq_timesteps,
                 shuffle_buffer_size=self.training_dataset_cfg.shuffle_buffer_size_per_gpu
@@ -2116,6 +2117,7 @@ class SupervisedDataModule(pl.LightningDataModule):
                     frame_height=self.cfg.shared.frame_height,
                     frame_width=self.cfg.shared.frame_width,
                     local_prefix=validation_dataset_cfg.local_prefix,
+                    load_video_name=validation_dataset_cfg.load_video_name,
                     shuffle=False,
                     T=self.cfg.shared.n_seq_timesteps,
                     shuffle_buffer_size=validation_dataset_cfg.shuffle_buffer_size_per_gpu

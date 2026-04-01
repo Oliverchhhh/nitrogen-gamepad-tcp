@@ -58,9 +58,6 @@ stage3_finetune:
         - translation
         - random_blur
         - sharpness
-    # 数据加载参数（可根据数据集大小和 GPU 数量调整）
-    # ⚠️ 注意：如果遇到 "No space left on device" 错误，减少这些参数
-    # ⚠️⚠️ 当前已设为最小配置以避免 /dev/shm 空间不足
     n_preprocess_threads_per_gpu: 1  # 每个 GPU 的预处理线程数（降到 1，单线程最小化共享内存）
     preprocessed_chunks_queue_size_per_gpu: 16  # 预处理队列大小（降到 16）
     shuffle_buffer_size_per_gpu: 200  # 打乱缓冲区大小（降到 200）

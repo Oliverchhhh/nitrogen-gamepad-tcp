@@ -14,6 +14,7 @@ from elefant.text_tokenizer.config import TextTokenizerConfig
 
 class DatasetConfig(ConfigBase):
     local_prefix: str = ""
+    load_video_name: Optional[str] = None
     shuffle: bool = True
     n_preprocess_threads_per_gpu: int = 16
     preprocessed_chunks_queue_size_per_gpu: int = 4096

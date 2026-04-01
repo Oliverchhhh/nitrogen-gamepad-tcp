@@ -5,6 +5,7 @@ from elefant.im_tokenizer.tokenizer import (
     VitImageTokenizer,
     DinoV2Tokenizer,
     Vjepa2Tokenizer,
+    StaMoTokenizer,
 )
 
 
@@ -23,5 +24,7 @@ def get_tokenizer(
         return DinoV2Tokenizer(config, frame_height, frame_width, embed_dim)
     elif config.type == "vjepa2":
         return Vjepa2Tokenizer(config, frame_height, frame_width, embed_dim)
+    elif config.type == "stamo":
+        return StaMoTokenizer(config, frame_height, frame_width, embed_dim)
     else:
         raise ValueError(f"Unknown tokenizer: {config.type}")

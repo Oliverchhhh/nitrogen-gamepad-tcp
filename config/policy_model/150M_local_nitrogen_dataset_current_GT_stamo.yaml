@@ -1,5 +1,5 @@
 shared:
-  output_path: output/policy_model/150M_nitrogen_cuphead_all
+  output_path: output/policy_model/150M_nitrogen_current_gt_stamo
   n_seq_timesteps: 200
   frame_height: 192
   frame_width: 192
@@ -21,7 +21,6 @@ shared:
 inference:
   mouse_sampling_approach: "truncated_normal"
 
-# Policy Model Configuration (Stage 2 student & 3 model)
 policy_model:
   n_transformer_layers: 10
   n_q_head: 16
@@ -29,30 +28,51 @@ policy_model:
   n_thinking_tokens: 1
   transformer_dim: &transformer_dim 1024
   mask_block_size: 128
-  attention_history_len: [200, 200, 200, 200, 200, 200, 200, 200, 200, 200] # the length of the attention history needs to be the same as n_transformer_layers
+  attention_history_len: [200, 200, 200, 200, 200, 200, 200, 200, 200, 200]
   n_kv_sink_tokens: 0
   model_type: "dense"
   action_decoder:
     embed_dim: *transformer_dim
 
-
 stage3_finetune:
+  init:
+    auto_resume_latest_checkpoint: false
+  future_vision_target_mode: "current"
+  # 输入侧仍使用 shared.tokenizer (conv)；
+  # 仅 state 监督目标使用 StaMo tokenizer (ViT backbone + Projector)。
+  state_target_tokenizer:
+    type: "stamo"
+    stamo_tokenizer_config:
+      # timm ViT backbone
+      model_name: "vit_base_patch14_reg4_dinov2.lvd142m"
+      backbone_local_ckpt: null        # 使用 timm 在线权重；如有本地权重可填路径
+      backbone_pretrained: true
+      # Projector 权重（如有训练好的 StaMo checkpoint 可填路径）
+      projector_ckpt: null
+      frozen: true
+      img_size: 224
+      # Projector 超参（与 StaMo 默认一致）
+      num_token: 2
+      num_attn_layers: 6
+      num_attn_compress_layers: 6
+      hidden_dim: 1024
+      cross_attention_dim: 512
+      output_align_dim: 4096
   optim:
     learning_rate: 0.0001
     weight_decay: 0.0001
     beta_1: 0.9
     beta_2: 0.999
 
-  validation_step_interval: 999999  # 设置极大值，训练期间不触发 validation
-  n_validation_steps: &n_validation_steps 0  # 0 步 = 跳过 validation
-  save_every_n_steps: 50000  # 每 50000 步保存一次检查点
-  n_training_steps: 500000  # 训练总步数
+  validation_step_interval: 20000
+  n_validation_steps: &n_validation_steps 200
+  save_every_n_steps: 10000
+  n_training_steps: 500000
   accumulate_grad_batches: 1
 
   training_dataset:
-    batch_size: &stage3_batch_size 4
-    local_prefix: "cuphead_dataset_converted"
-    load_video_name: "192x192.mp4"
+    batch_size: &stage3_batch_size 2
+    local_prefix: "dataset_nitrogen_toy"
     warn_on_starvation: false
     always_labelled: true
     rand_augmentation:
@@ -74,8 +94,7 @@ stage3_finetune:
 
   validation_datasets:
     - batch_size: *stage3_batch_size
-      local_prefix: "cuphead_dataset_converted"
-      load_video_name: "192x192.mp4"
+      local_prefix: "dataset_nitrogen_toy"
       validation_name: "overall"
       n_preprocess_threads_per_gpu: &validation_stage3_n_preprocess_threads_per_gpu 8
       preprocessed_chunks_queue_size_per_gpu: &validation_stage3_preprocessed_chunks_queue_size_per_gpu 1
@@ -84,9 +103,8 @@ stage3_finetune:
       warn_on_starvation: false
       always_labelled: true
 
-
 wandb:
   enabled: True
   entity: "zjut-cv"
   project: "policy_model"
-  exp_name: "150M-nitrogen-cuphead-all"
+  exp_name: "150M-local-nitrogen-dataset-current-gt-stamo"

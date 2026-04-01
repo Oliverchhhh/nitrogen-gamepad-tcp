@@ -23,8 +23,9 @@ __pycache__/
 Thumbs.db
 
 # 训练产生的文件 / 大目录
-output/
+output
 .elefant_temp/
+.elefant_temp_*/
 logs/
 wandb/
 dataset/
@@ -32,6 +33,16 @@ checkpoints/
 nitrogen_datasets/
 dataset_toy/
 elefant_rust/target/
+
+# 数据集 / 模型权重目录（不提交）
+cuphead_dataset_converted
+NitroGen_cuphead*
+20260330_cuphead_RJT
+Vjepa2-1_ViT_B_16
+ossutil_output
+
+# 第三方依赖（独立 git 仓库，需单独 clone）
+third_party/
 
 # 各种模型权重 / 大文件
 *.ckpt
@@ -46,3 +57,4 @@ batch_*.tar.gz
 *.md
 !README.md
 !README_STAGE3_FUTURE_VISION.md
+!README_INFERENCE_GAMEPAD_NATIVE.md

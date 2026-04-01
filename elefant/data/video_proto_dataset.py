@@ -132,8 +132,13 @@ def resize_image_for_model(im: torch.Tensor, inp_dim) -> torch.Tensor:
     assert im.shape[0] == 3
     if im.shape[1] == inp_dim[0] and im.shape[2] == inp_dim[1]:
         return im
-    resized_im = _canonical_resize(im, inp_dim)
-    # resized_im = F.resize(im, inp_dim)
+    # (C, H, W) -> (1, C, H, W) for F.interpolate, then squeeze back
+    resized_im = F.interpolate(
+        im.unsqueeze(0).float(),
+        size=(inp_dim[0], inp_dim[1]),
+        mode="bilinear",
+        align_corners=False,
+    ).squeeze(0).to(im.dtype)
     return resized_im
 
 
@@ -194,12 +199,16 @@ def _preprocess_example(
 ):
     """Parse a proto and video into chunks."""
     decoder = VideoDecoder(video, device="cpu", num_ffmpeg_threads=1)
-    n_frames = len(decoder)
+    n_video_frames = len(decoder)
     proto_parser = proto_parser_factory(
         proto_local_path=proto,
         always_labelled=config.always_labelled,
-        n_frames=n_frames,
+        n_frames=n_video_frames,
     )
+    # Use the minimum of video frames and proto annotations to avoid out-of-bounds access.
+    n_proto_frames = len(proto_parser.frame_annotations) if proto_parser.frame_annotations is not None else n_video_frames
+    n_frames = min(n_video_frames, n_proto_frames)
+
     # Check that we have at least T+1 frames so that every chunk has a frame to look ahead.
     if n_frames < 2:
         logging.warning(f"Video {proto} has less than 2 frames, skipping.")

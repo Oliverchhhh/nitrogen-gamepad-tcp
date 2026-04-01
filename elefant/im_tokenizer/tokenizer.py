@@ -118,6 +118,163 @@ class DinoV2Tokenizer(ImageBaseTokenizer):
         return features
 
 
+class StaMoTokenizer(ImageBaseTokenizer):
+    """
+    StaMo Tokenizer - 使用 timm ViT backbone + Q-Former 式 Projector 将图像压缩为紧凑 token。
+
+    数据流：
+      [B, T, C, H, W] -> 逐帧 -> VisionBackbone -> [B*T, N_patch, C_vit]
+                       -> Projector -> [B*T, num_token, output_align_dim]
+                       -> proj_to_embed_dim -> [B, T, num_token, embed_dim]
+
+    作为 state_target_tokenizer 使用时，_build_state_target 会对 dim=2 做 mean pool，
+    得到 [B, T, embed_dim] 的全局状态表示。
+    """
+
+    def __init__(
+        self,
+        config: ImageTokenizerConfig,
+        frame_height: int,
+        frame_width: int,
+        embed_dim: int,
+    ):
+        super().__init__(config)
+
+        if config.stamo_tokenizer_config is None:
+            raise ValueError("stamo_tokenizer_config must be provided when type='stamo'")
+
+        stamo_cfg = config.stamo_tokenizer_config
+        self.stamo_cfg = stamo_cfg
+        self.frame_height = frame_height
+        self.frame_width = frame_width
+        self.embed_dim = embed_dim
+
+        # ---- 添加 StaMo 源码路径 ----
+        import sys
+        from pathlib import Path
+
+        stamo_path = os.getenv("STAMO_PATH")
+        if stamo_path is None:
+            candidate_paths = [
+                Path(__file__).resolve().parents[2] / "third_party" / "StaMo",
+                Path(__file__).resolve().parents[2] / "third_part" / "StaMo",
+            ]
+            for p in candidate_paths:
+                if p.exists():
+                    stamo_path = str(p)
+                    break
+
+        if stamo_path and os.path.exists(stamo_path):
+            if stamo_path not in sys.path:
+                sys.path.insert(0, stamo_path)
+            logging.info(f"已添加 StaMo 路径到 sys.path: {stamo_path}")
+
+        # ---- 构建 VisionBackbone ----
+        from stamo.renderer.model.backbone import VisionBackbone
+
+        self.vision_backbone = VisionBackbone(
+            img_size=stamo_cfg.img_size,
+            model_name=stamo_cfg.model_name,
+            pretrained=stamo_cfg.backbone_pretrained,
+            local_ckpt=stamo_cfg.backbone_local_ckpt,
+        )
+
+        # ---- 构建 Projector ----
+        from stamo.renderer.model.projector import Projector
+        from types import SimpleNamespace
+
+        projector_args = SimpleNamespace(
+            projector=SimpleNamespace(
+                num_token=stamo_cfg.num_token,
+                num_attn_layers=stamo_cfg.num_attn_layers,
+                num_attn_compress_layers=stamo_cfg.num_attn_compress_layers,
+                hidden_dim=stamo_cfg.hidden_dim,
+                cross_attention_dim=stamo_cfg.cross_attention_dim,
+                output_align_dim=stamo_cfg.output_align_dim,
+            )
+        )
+        self.projector = Projector(
+            projector_args,
+            patches=self.vision_backbone.patches,
+            channels=self.vision_backbone.channels,
+        )
+
+        # ---- 加载 Projector 权重 ----
+        if stamo_cfg.projector_ckpt and os.path.exists(stamo_cfg.projector_ckpt):
+            projector_state = torch.load(stamo_cfg.projector_ckpt, map_location="cpu")
+            msg = self.projector.load_state_dict(projector_state, strict=False)
+            if msg.missing_keys:
+                logging.warning(f"StaMo Projector missing keys: {msg.missing_keys}")
+            if msg.unexpected_keys:
+                logging.warning(f"StaMo Projector unexpected keys: {msg.unexpected_keys}")
+            logging.info(f"已加载 StaMo Projector 权重: {stamo_cfg.projector_ckpt}")
+        else:
+            logging.warning("StaMo Projector 未加载预训练权重，使用随机初始化")
+
+        # ---- 冻结 ----
+        if stamo_cfg.frozen:
+            self.vision_backbone.eval()
+            self.projector.eval()
+            for param in self.vision_backbone.parameters():
+                param.requires_grad = False
+            for param in self.projector.parameters():
+                param.requires_grad = False
+
+        # ---- 输出维度对齐 ----
+        self.stamo_output_dim = stamo_cfg.output_align_dim
+        self.n_img_tokens = stamo_cfg.num_token
+
+        if self.stamo_output_dim != embed_dim:
+            self.proj_to_embed_dim = nn.Linear(self.stamo_output_dim, embed_dim)
+        else:
+            self.proj_to_embed_dim = None
+
+        # ---- 预处理 transform（与 timm backbone 一致）----
+        self.backbone_transforms = self.vision_backbone.transforms
+
+    def get_n_img_tokens(self) -> int:
+        return self.n_img_tokens
+
+    def forward(self, input_tensor: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            input_tensor: [B, T, C, H, W]
+        Returns:
+            [B, T, num_token, embed_dim]
+        """
+        B, T, C, H, W = input_tensor.shape
+
+        # 逐帧处理：reshape 成 [B*T, C, H, W]
+        x = input_tensor.reshape(B * T, C, H, W)
+
+        # resize 到 StaMo 期望的尺寸
+        if H != self.stamo_cfg.img_size or W != self.stamo_cfg.img_size:
+            x = F.interpolate(
+                x,
+                size=(self.stamo_cfg.img_size, self.stamo_cfg.img_size),
+                mode="bilinear",
+                align_corners=False,
+            )
+
+        # timm backbone 归一化
+        x = self.backbone_transforms(x)
+
+        # VisionBackbone: [B*T, C, H, W] -> [B*T, N_patch, C_vit]
+        with torch.set_grad_enabled(self.training and not self.stamo_cfg.frozen):
+            patch_features = self.vision_backbone(x)
+            # Projector: [B*T, N_patch, C_vit] -> [B*T, num_token, output_align_dim]
+            compressed = self.projector(patch_features)
+
+        # 投影到 embed_dim
+        if self.proj_to_embed_dim is not None:
+            compressed = self.proj_to_embed_dim(compressed)
+
+        # reshape 回 [B, T, num_token, embed_dim]
+        compressed = compressed.view(B, T, self.n_img_tokens, self.embed_dim)
+
+        return compressed
+
+
 class Vjepa2Tokenizer(ImageBaseTokenizer):
     """
     V-JEPA 2 Tokenizer - 使用 V-JEPA 2 作为视觉编码器
