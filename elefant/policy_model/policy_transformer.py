@@ -703,7 +703,7 @@ class PolicyCausalTransformer(torch.nn.Module):
                 inference_mode=True,
             )
         sampled_action_reshaped = pytree.tree_map(
-            lambda x: x.unsqueeze(0), sampled_action
+            lambda x: x.unsqueeze(0).to(img.device), sampled_action
         )
 
         if self.config.zero_action_input:
@@ -1269,7 +1269,7 @@ class PolicyFutureCausalTransformer(PolicyCausalTransformer):
             inference_mode=True,
         )
         sampled_action_reshaped = pytree.tree_map(
-            lambda x: x.unsqueeze(0), sampled_action
+            lambda x: x.unsqueeze(0).to(img.device), sampled_action
         )
 
         if self.config.zero_action_input:
