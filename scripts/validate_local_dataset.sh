@@ -7,8 +7,11 @@ set -e  # 遇到错误立即退出
 
 # 配置变量
 CONFIG_FILE="config/policy_model/150M_local_nitrogen_dataset_current.yaml"
+# CONFIG_FILE="config/policy_model/150M_local_nitrogen_dataset.yaml"
 DATA_FOLDER="NitroGen_cuphead_toy"
-CHECKPOINT_PATH=""
+# CHECKPOINT_PATH="/data2T/rjt/nitrogen-openp2p2-future-frame/output/policy_model/150M_nitrogen_cuphead_all/stage3_finetune/checkpoint-step=00100000.ckpt"
+# CHECKPOINT_PATH="output_20260401/policy_model/150M_nitrogen/stage3_finetune/checkpoint-step=00040000.ckpt"
+CHECKPOINT_PATH="output/policy_model/150M_nitrogen_cuphead_all_current_gt_vjepa2/stage3_future_vision/checkpoint-step=00140000.ckpt"
 TEMP_CONFIG_FILE=""
 MIN_STEPS=""
 MAX_STEPS=""
@@ -160,6 +163,22 @@ if "training_dataset" in cfg["stage3_finetune"]:
 if "validation_datasets" in cfg["stage3_finetune"]:
     for item in cfg["stage3_finetune"]["validation_datasets"]:
         item["local_prefix"] = data_folder
+
+# 离线验证需要跑完整个数据集，强制覆盖 n_validation_steps
+# 原始配置可能设为 0（训练期间跳过）
+# ignore_iterator_reset=True 时 dataloader 会无限循环，必须用有限步数控制
+# 正确计算：n_protos × (帧数 / n_seq_timesteps) / batch_size = 独立样本数
+# NitroGen_cuphead_toy: 12 proto × (1200 / 200) / 1 = 72 steps（跑完一个 epoch）
+import os, glob
+val_datasets = cfg["stage3_finetune"].get("validation_datasets", [])
+local_prefix = val_datasets[0]["local_prefix"] if val_datasets else data_folder
+n_seq_timesteps = cfg.get("shared", {}).get("n_seq_timesteps", 200)
+frames_per_chunk = 1200  # NitroGen 标准切片长度
+protos = glob.glob(os.path.join(local_prefix, "**/*.proto"), recursive=True)
+n_protos = len(protos)
+# BATCH_SIZE_FOR_VAL=1，每个 proto 产出 frames_per_chunk // n_seq_timesteps 个样本
+n_validation_steps = n_protos * (frames_per_chunk // n_seq_timesteps)
+cfg["stage3_finetune"]["n_validation_steps"] = max(1, n_validation_steps)
 
 with output_path.open("w", encoding="utf-8") as f:
     yaml.safe_dump(cfg, f, allow_unicode=True, sort_keys=False)

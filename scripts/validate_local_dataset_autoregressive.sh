@@ -7,8 +7,8 @@ set -e
 # 配置变量
 CONFIG_FILE="config/policy_model/150M_local_nitrogen_dataset_current.yaml"
 DATA_FOLDER="NitroGen_cuphead_toy"
-CHECKPOINT_PATH=""
-N_SEQUENCES=12
+CHECKPOINT_PATH="output_20260401/policy_model/150M_nitrogen/stage3_finetune/checkpoint-step=00040000.ckpt"
+N_SEQUENCES=72
 TEMPERATURE=1.0
 
 # 颜色输出
@@ -24,7 +24,7 @@ usage() {
     echo "  -k    checkpoint 路径（必填）"
     echo "  -d    验证数据集路径 (默认: NitroGen_cuphead_toy)"
     echo "  -c    配置文件路径 (默认: config/policy_model/150M_local_nitrogen_dataset_current.yaml)"
-    echo "  -n    验证的视频序列数量 (默认: 12)"
+    echo "  -n    验证的视频序列数量 (默认: 72，对应 NitroGen_cuphead_toy 全部独立样本)"
     echo "  -t    采样温度 (默认: 1.0)"
     echo "  -h    显示帮助"
     echo

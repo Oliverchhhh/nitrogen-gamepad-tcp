@@ -182,6 +182,14 @@ class Stage3FineTuneConfig(PolicyTrainingConfig):
             "If unset, use shared.tokenizer."
         ),
     )
+    use_precomputed_vision_features: bool = pydantic.Field(
+        default=False,
+        description=(
+            "If True, use precomputed V-JEPA2 features (vjepa2_features.pt) from each chunk directory "
+            "instead of running the state_target_tokenizer online. "
+            "This avoids loading the V-JEPA2 model and speeds up training."
+        ),
+    )
 
 
 class SharedConfig(ConfigBase):

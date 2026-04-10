@@ -134,6 +134,18 @@ if "validation_datasets" in cfg["stage3_finetune"]:
     for item in cfg["stage3_finetune"]["validation_datasets"]:
         item["local_prefix"] = data_folder
 
+# 动态计算并覆盖 n_validation_steps，确保跑完整个验证集
+# 原始配置 n_validation_steps=0 会导致只跑极少样本
+import os, glob as _glob
+val_datasets = cfg["stage3_finetune"].get("validation_datasets", [])
+local_prefix = val_datasets[0]["local_prefix"] if val_datasets else data_folder
+n_seq_timesteps = cfg.get("shared", {}).get("n_seq_timesteps", 200)
+frames_per_chunk = 1200  # NitroGen 标准切片长度
+protos = _glob.glob(os.path.join(local_prefix, "**/*.proto"), recursive=True)
+n_protos = len(protos)
+n_validation_steps = n_protos * (frames_per_chunk // n_seq_timesteps)
+cfg["stage3_finetune"]["n_validation_steps"] = max(1, n_validation_steps)
+
 with output_path.open("w", encoding="utf-8") as f:
     yaml.safe_dump(cfg, f, allow_unicode=True, sort_keys=False)
 PY

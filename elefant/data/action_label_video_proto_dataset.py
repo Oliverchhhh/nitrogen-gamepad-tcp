@@ -46,6 +46,8 @@ class ActionLabelVideoDatasetItem(NamedTuple):
     text_embeddings: torch.Tensor  # (T, n_text_tokens, text_embedding_dim)
     system_action_mask: torch.Tensor  # (T)
     valid_frame_mask: torch.Tensor | None = None
+    # 预计算的 V-JEPA2 全局视觉表征 (T, embed_dim)，用于离线 state target
+    precomputed_vision_features: torch.Tensor | None = None
 
 
 class ActionLabelAnnotationParser(ProtoParser):

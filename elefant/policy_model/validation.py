@@ -299,6 +299,8 @@ def move_action_label_video_dataset_item_to_device(
     moved_system_action_mask = batch.system_action_mask.to(device)
     moved_valid_frame_mask = batch.valid_frame_mask.to(device)
     moved_text_embeddings = batch.text_embeddings.to(device)
+    precomputed = getattr(batch, 'precomputed_vision_features', None)
+    moved_precomputed = precomputed.to(device) if precomputed is not None else None
     return ActionLabelVideoDatasetItem(
         frames=moved_frames,
         action_annotations=moved_action_annotations,
@@ -307,6 +309,7 @@ def move_action_label_video_dataset_item_to_device(
         system_action_mask=moved_system_action_mask,
         valid_frame_mask=moved_valid_frame_mask,
         text_embeddings=moved_text_embeddings,
+        precomputed_vision_features=moved_precomputed,
     )
 
 
@@ -346,7 +349,8 @@ def set_validation_dataset_cfg_to_single_thread(validation_dataset_cfgs, batch_s
 
 
 def _is_future_vision_model(config: LightningPolicyConfig) -> bool:
-    return config.stage3_finetune.state_target_tokenizer is not None
+    return (config.stage3_finetune.state_target_tokenizer is not None
+            or config.stage3_finetune.use_precomputed_vision_features)
 
 
 def _load_validation_model(checkpoint_path: str, config: LightningPolicyConfig):
@@ -379,6 +383,25 @@ def _load_validation_model(checkpoint_path: str, config: LightningPolicyConfig):
             )
 
         if disallowed_missing_keys or unexpected_keys:
+            # Compatibility fallback:
+            # Some existing OpenP2P checkpoints are Stage3 BC checkpoints, while
+            # the validation config may enable future-vision fields
+            # (state_target_tokenizer/future_vision_target_mode).
+            # In that case, FutureVision-only weights are expected to be missing.
+            future_only_missing = {
+                "bc_transformer.state_out_token",
+                "bc_transformer.future_vision_head.weight",
+            }
+            if set(disallowed_missing_keys).issubset(future_only_missing) and not unexpected_keys:
+                logging.warning(
+                    "Checkpoint appears to be Stage3LabelledBC while config requests "
+                    "Stage3FutureVision. Falling back to Stage3LabelledBCLightning. "
+                    "missing_keys=%s",
+                    disallowed_missing_keys,
+                )
+                return Stage3LabelledBCLightning.load_from_checkpoint(
+                    checkpoint_path, config=config, inference_mode=True
+                )
             raise RuntimeError(
                 "Unexpected checkpoint incompatibility for Stage3FutureVisionLightning. "
                 f"disallowed_missing_keys={disallowed_missing_keys}, "
@@ -405,6 +428,7 @@ def _calculate_validation_loss(model, batch_to_cuda, actions_in, masked_labels):
         future_vision_target = model._build_state_target(
             frames=frames,
             future_vision_pred=future_vision_pred,
+            precomputed_vision_features=getattr(batch_to_cuda, 'precomputed_vision_features', None),
         )
         future_vision_loss = torch.nn.functional.mse_loss(
             future_vision_pred, future_vision_target
@@ -417,13 +441,27 @@ def _calculate_validation_loss(model, batch_to_cuda, actions_in, masked_labels):
         losses["future_vision"] = future_vision_loss
         return loss, losses, auxiliary_outputs, action_logits
 
-    loss, _, losses, auxiliary_outputs = model._calculate_loss(
-        batch_to_cuda,
-        actions_in,
-        masked_labels,
-        batch_to_cuda.text_embeddings,
+    # Stage3LabelledBCLightning path:
+    # Keep the same loss math as training (_calculate_action_losses_from_logits_eager),
+    # and also return action_logits for gamepad metrics computation.
+    frames = model._normalize_frames(batch_to_cuda.frames)
+    batch_size = batch_to_cuda.frames.shape[0]
+    T = batch_to_cuda.frames.shape[1]
+    action_embeddings_in = model.action_in_to_tokens(actions_in)
+    action_out_embeddings, _, auxiliary_losses, auxiliary_outputs = (
+        model.transformer_forward_function(
+            frames, action_embeddings_in, batch_to_cuda.text_embeddings
+        )
     )
-    return loss, losses, auxiliary_outputs, None
+    action_logits = model.action_out_tokens_to_logits(action_out_embeddings)
+    loss, _, losses = model._calculate_action_losses_from_logits_eager(
+        action_logits=action_logits,
+        masked_labels=masked_labels,
+        auxiliary_losses=auxiliary_losses,
+        batch_size=batch_size,
+        T=T,
+    )
+    return loss, losses, auxiliary_outputs, action_logits
 
 
 def _flatten_gamepad_metrics(gp: Dict[str, Any], prefix: str) -> Dict[str, float]:

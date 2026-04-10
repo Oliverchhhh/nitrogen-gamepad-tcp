@@ -5,8 +5,8 @@ set -e  # 遇到错误立即退出
 
 # 配置变量
 CONFIG_FILE="config/policy_model/150M_local_nitrogen_dataset_current.yaml"
-DATA_FOLDER="dataset"  # 数据集路径（相对于项目根目录）
-OUTPUT_DIR=""  # 输出目录（可选，不传则使用配置文件中的 shared.output_path）
+DATA_FOLDER="cuphead_dataset_converted"  # 数据集路径（相对于项目根目录）
+OUTPUT_DIR="output/policy_model/150M_nitrogen_cuphead_all_current_gt_vjepa2"  # 默认输出目录（覆盖 shared.output_path）；可用 -o 覆盖
 TEMP_CONFIG_FILE=""
 NO_COMPILE=false
 
@@ -21,7 +21,7 @@ usage() {
     echo
     echo "参数:"
     echo "  -d    数据集路径 (默认: dataset)"
-    echo "  -o    输出目录。传入后将覆盖配置文件中的 shared.output_path"
+    echo "  -o    输出目录（默认: output/policy_model/150M_nitrogen_cuphead_all_current_gt_vjepa2），覆盖 shared.output_path"
     echo "  -c    配置文件路径 (默认: config/policy_model/150M_local_nitrogen_dataset_current.yaml)"
     echo "  -n    禁用 torch.compile（向 train_future.py 透传 --no_compile）"
     echo "  -h    显示帮助"
@@ -144,7 +144,7 @@ export TORCHINDUCTOR_FX_GRAPH_CACHE=1
 export TORCHINDUCTOR_CACHE_DIR=".elefant_temp_current_gt_vjepa/torch_compiler/inductor_cache"
 
 # 设置 CUDA 设备（与 train_local_dataset.sh 对齐，默认单卡避免多卡环境异常）
-export CUDA_VISIBLE_DEVICES=1
+export CUDA_VISIBLE_DEVICES=0,1,2,3
 echo -e "${GREEN}单卡模式: CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}${NC}"
 
 # ⚠️ 关键：清理 /dev/shm 中的所有 PyTorch 残留文件
@@ -174,6 +174,13 @@ if [ "$SHM_AVAIL_GB" -lt 20 ]; then
         exit 1
     fi
 fi
+
+# NCCL 超时设置：数据集较小时 epoch 切换会触发 buffer 重填，
+# 单线程预处理可能阻塞较久，默认 30 分钟不够用，改为 2 小时。
+export NCCL_TIMEOUT=7200000
+export TORCH_NCCL_BLOCKING_WAIT=0
+export NCCL_ASYNC_ERROR_HANDLING=1
+echo -e "${GREEN}✓ NCCL 超时设置为 7200s (2小时)${NC}"
 
 echo -e "${GREEN}✓ 环境变量设置完成${NC}"
 

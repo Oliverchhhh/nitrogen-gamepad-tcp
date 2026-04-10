@@ -1525,18 +1525,22 @@ class Stage3FutureVisionLightning(PolicyModelTrainer):
         )
         self.future_vision_target_mode = self.config.stage3_finetune.future_vision_target_mode
         self.state_target_tokenizer = None
-        target_tokenizer_cfg = self.config.stage3_finetune.state_target_tokenizer
-        if target_tokenizer_cfg is not None:
-            self.state_target_tokenizer = get_tokenizer(
-                target_tokenizer_cfg,
-                self.config.policy_model.transformer_dim,
-                self.config.shared.frame_height,
-                self.config.shared.frame_width,
-            )
-            # State target tokenizer only provides detached supervision targets.
-            self.state_target_tokenizer.eval()
-            for param in self.state_target_tokenizer.parameters():
-                param.requires_grad = False
+        # 如果使用预计算表征，跳过加载 state_target_tokenizer（省显存 + 加速启动）
+        if self.config.stage3_finetune.use_precomputed_vision_features:
+            logging.info("使用预计算 V-JEPA2 表征，跳过加载 state_target_tokenizer")
+        else:
+            target_tokenizer_cfg = self.config.stage3_finetune.state_target_tokenizer
+            if target_tokenizer_cfg is not None:
+                self.state_target_tokenizer = get_tokenizer(
+                    target_tokenizer_cfg,
+                    self.config.policy_model.transformer_dim,
+                    self.config.shared.frame_height,
+                    self.config.shared.frame_width,
+                )
+                # State target tokenizer only provides detached supervision targets.
+                self.state_target_tokenizer.eval()
+                for param in self.state_target_tokenizer.parameters():
+                    param.requires_grad = False
         
         # Replace bc_transformer with PolicyFutureCausalTransformer
         from elefant.policy_model.policy_transformer import (
@@ -1595,21 +1599,41 @@ class Stage3FutureVisionLightning(PolicyModelTrainer):
         self,
         frames: torch.Tensor,
         future_vision_pred: torch.Tensor,
+        precomputed_vision_features: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Build state supervision target for s0 branch.
         Modes:
         - future: next-frame global visual feature (last step uses dummy zeros)
         - current: current-frame global visual feature reconstruction
+
+        如果提供了 precomputed_vision_features (来自离线 V-JEPA2 预计算)，
+        则直接使用，跳过在线 tokenizer 推理。
         """
-        target_tokenizer = self.state_target_tokenizer or self.image_tokenizer
         if self.future_vision_target_mode == "current":
+            if precomputed_vision_features is not None:
+                # 预计算表征已经是 mean-pooled 的 [B, T, embed_dim]
+                # 对齐 dtype/device 到 future_vision_pred（float16 → bfloat16 等）
+                return precomputed_vision_features.to(
+                    dtype=future_vision_pred.dtype, device=future_vision_pred.device
+                ).detach()
+            target_tokenizer = self.state_target_tokenizer or self.image_tokenizer
             with torch.no_grad():
                 current_frames_tokens = target_tokenizer(frames)
             current_frames_global = current_frames_tokens.mean(dim=2)
             return current_frames_global.detach()
 
         # default "future"
+        if precomputed_vision_features is not None:
+            # future 模式: 取下一帧的表征，最后一帧用 dummy zeros
+            feats = precomputed_vision_features.to(
+                dtype=future_vision_pred.dtype, device=future_vision_pred.device
+            )
+            next_features = feats[:, 1:, :]
+            dummy_global = torch.zeros_like(future_vision_pred[:, 0:1, :])
+            future_vision_target = torch.cat([next_features, dummy_global], dim=1)
+            return future_vision_target.detach()
+        target_tokenizer = self.state_target_tokenizer or self.image_tokenizer
         next_frames = frames[:, 1:, :, :, :]
         with torch.no_grad():
             next_frames_tokens = target_tokenizer(next_frames)
@@ -1763,6 +1787,49 @@ class Stage3FutureVisionLightning(PolicyModelTrainer):
         }
         return action_loss, losses
 
+    # ------------------------------------------------------------------
+    # Checkpoint hooks: exclude frozen state_target_tokenizer weights
+    # to keep checkpoint size small (saves ~350 MB per ckpt for vjepa2).
+    # The tokenizer is re-initialised from its own local file on load.
+    # ------------------------------------------------------------------
+    _EXCLUDED_CKPT_PREFIX = "state_target_tokenizer"
+
+    def on_save_checkpoint(self, checkpoint: dict) -> None:
+        keys_to_remove = [
+            k for k in checkpoint["state_dict"]
+            if k.startswith(self._EXCLUDED_CKPT_PREFIX)
+        ]
+        for k in keys_to_remove:
+            del checkpoint["state_dict"][k]
+        if keys_to_remove:
+            logging.info(
+                "on_save_checkpoint: removed %d state_target_tokenizer keys "
+                "(%s...) from checkpoint to save space.",
+                len(keys_to_remove),
+                keys_to_remove[0],
+            )
+
+    def on_load_checkpoint(self, checkpoint: dict) -> None:
+        # state_target_tokenizer weights are not in the checkpoint;
+        # add dummy entries so Lightning's strict-load check passes,
+        # then let the module re-initialise them from its own source.
+        if self.state_target_tokenizer is None:
+            return
+        current_sd = self.state_dict()
+        missing = [
+            k for k in current_sd
+            if k.startswith(self._EXCLUDED_CKPT_PREFIX)
+            and k not in checkpoint["state_dict"]
+        ]
+        for k in missing:
+            checkpoint["state_dict"][k] = current_sd[k]
+        if missing:
+            logging.info(
+                "on_load_checkpoint: re-inserted %d state_target_tokenizer keys "
+                "from live model (not stored in checkpoint).",
+                len(missing),
+            )
+
     def configure_optimizers(self):
         assert not self.inference_mode
         optimizer = optim.AdamW(
@@ -1855,17 +1922,20 @@ class Stage3FutureVisionLightning(PolicyModelTrainer):
                 ),
             )
 
-            future_vision_target = self._build_state_target(
-                frames=frames,
-                future_vision_pred=future_vision_pred,
-            )
-            future_vision_loss = F.mse_loss(future_vision_pred, future_vision_target)
+            return action_out_embeddings, future_vision_pred, auxiliary_losses, auxiliary_outputs, frames
 
-            return action_out_embeddings, future_vision_loss, auxiliary_losses, auxiliary_outputs
-
-        action_out_embeddings, future_vision_loss, auxiliary_losses, auxiliary_outputs = (
+        action_out_embeddings, future_vision_pred, auxiliary_losses, auxiliary_outputs, frames = (
             _compiled_forward_and_future_loss(batch, actions_in, text_tokens_embed)
         )
+
+        # 在 compile 外部计算 state target（支持预计算表征的 None 分支）
+        precomputed_feats = getattr(batch, 'precomputed_vision_features', None)
+        future_vision_target = self._build_state_target(
+            frames=frames,
+            future_vision_pred=future_vision_pred,
+            precomputed_vision_features=precomputed_feats,
+        )
+        future_vision_loss = F.mse_loss(future_vision_pred, future_vision_target)
 
         # Keep complex action CE/z-loss in eager mode to avoid over-fusion/compile failures.
         action_logits = self.action_out_tokens_to_logits(action_out_embeddings)
@@ -1913,19 +1983,21 @@ class Stage3FutureVisionLightning(PolicyModelTrainer):
                 )
             )
 
-            future_vision_target = self._build_state_target(
-                frames=frames,
-                future_vision_pred=future_vision_pred,
-            )
-            future_vision_loss = F.mse_loss(future_vision_pred, future_vision_target)
+            return action_out_embeddings, future_vision_pred, auxiliary_losses, auxiliary_outputs, frames
 
-            return action_out_embeddings, future_vision_loss, auxiliary_losses, auxiliary_outputs
-
-        action_out_embeddings, future_vision_loss, auxiliary_losses, auxiliary_outputs = (
+        action_out_embeddings, future_vision_pred, auxiliary_losses, auxiliary_outputs, frames = (
             _compiled_validation_step(
             batch, text_tokens_embed
         )
         )
+
+        precomputed_feats = getattr(batch, 'precomputed_vision_features', None)
+        future_vision_target = self._build_state_target(
+            frames=frames,
+            future_vision_pred=future_vision_pred,
+            precomputed_vision_features=precomputed_feats,
+        )
+        future_vision_loss = F.mse_loss(future_vision_pred, future_vision_target)
         action_logits = self.action_out_tokens_to_logits(action_out_embeddings)
         action_loss, losses = self._calculate_action_loss_from_logits(
             action_logits, masked_labels, auxiliary_losses
@@ -2063,6 +2135,7 @@ class SupervisedDataModule(pl.LightningDataModule):
                 dataset_worker_num_workers=self.training_dataset_cfg.dataset_worker_num_workers_per_gpu,
                 dataset_unique_id="training_dataset",
                 text_tokenizer_config=self.text_tokenizer_config,
+                ignore_iterator_reset=True,
             ),
             device="cpu",
         )
@@ -2241,26 +2314,24 @@ def train_stage3_finetune(config: LightningPolicyConfig):
         save_top_k=-1,
     )
 
+    from datetime import timedelta
     if torch.cuda.device_count() > 1:
         logging.info(f"Using DDP strategy with {torch.cuda.device_count()} GPUs")
-        strategy = pl.pytorch.strategies.DDPStrategy(find_unused_parameters=True)
+        strategy = pl.pytorch.strategies.DDPStrategy(
+            find_unused_parameters=False,
+            timeout=timedelta(seconds=7200),
+        )
     else:
         logging.info("Using SingleDeviceStrategy for single GPU.")
-        # strategy = pl.pytorch.strategies.SingleDeviceStrategy(accelerator="auto")
-        # Setting strategy with single GPU explicitly seems to error.
-        # https://github.com/Lightning-AI/pytorch-lightning/issues/18902
         strategy = "auto"
 
     trainer = pl.Trainer(
         plugins=[async_checkpointer],
         callbacks=[checkpoint_callback],
         accelerator="auto",
-        # For debugging it can be useful to set devices to 1.
-        # for simpler stack traces etc.
         devices="auto",
         max_steps=config.stage3_finetune.n_training_steps,
         logger=wandb_logger,
-        # We multiply by accumulate_grad_batches to get the number of steps between validation steps in "real" steps.
         val_check_interval=config.stage3_finetune.validation_step_interval
         * config.stage3_finetune.accumulate_grad_batches,
         limit_val_batches=config.stage3_finetune.n_validation_steps,
@@ -2357,26 +2428,24 @@ def train_stage3_future_vision(config: LightningPolicyConfig):
         save_top_k=-1,
     )
 
+    from datetime import timedelta
     if torch.cuda.device_count() > 1:
         logging.info(f"Using DDP strategy with {torch.cuda.device_count()} GPUs")
-        strategy = pl.pytorch.strategies.DDPStrategy(find_unused_parameters=True)
+        strategy = pl.pytorch.strategies.DDPStrategy(
+            find_unused_parameters=False,
+            timeout=timedelta(seconds=7200),
+        )
     else:
         logging.info("Using SingleDeviceStrategy for single GPU.")
-        # strategy = pl.pytorch.strategies.SingleDeviceStrategy(accelerator="auto")
-        # Setting strategy with single GPU explicitly seems to error.
-        # https://github.com/Lightning-AI/pytorch-lightning/issues/18902
         strategy = "auto"
 
     trainer = pl.Trainer(
         plugins=[async_checkpointer],
         callbacks=[checkpoint_callback],
         accelerator="auto",
-        # For debugging it can be useful to set devices to 1.
-        # for simpler stack traces etc.
         devices="auto",
         max_steps=config.stage3_finetune.n_training_steps,
         logger=wandb_logger,
-        # We multiply by accumulate_grad_batches to get the number of steps between validation steps in "real" steps.
         val_check_interval=config.stage3_finetune.validation_step_interval
         * config.stage3_finetune.accumulate_grad_batches,
         limit_val_batches=config.stage3_finetune.n_validation_steps,

@@ -36,10 +36,12 @@ policy_model:
 
 stage3_finetune:
   init:
-    auto_resume_latest_checkpoint: false
+    auto_resume_latest_checkpoint: true
   future_vision_target_mode: "current"
+  # 使用离线预计算的 V-JEPA2 表征，跳过在线推理
+  use_precomputed_vision_features: true
   # 输入侧仍使用 shared.tokenizer (conv)；
-  # 仅 state 监督目标使用 vjepa2.1 tokenizer。
+  # 仅 state 监督目标使用 vjepa2.1 tokenizer（预计算模式下不加载）。
   state_target_tokenizer:
     type: "vjepa2"
     vjepa_tokenizer_config:
@@ -58,8 +60,8 @@ stage3_finetune:
     beta_1: 0.9
     beta_2: 0.999
 
-  validation_step_interval: 20000
-  n_validation_steps: &n_validation_steps 200
+  validation_step_interval: 999999  # 与 train_local_dataset 一致：训练期间不触发 validation
+  n_validation_steps: &n_validation_steps 0  # 0 = Lightning 侧跳过 val batch
   save_every_n_steps: 10000
   n_training_steps: 500000
   accumulate_grad_batches: 1
@@ -67,8 +69,10 @@ stage3_finetune:
   training_dataset:
     batch_size: &stage3_batch_size 2
     local_prefix: "dataset_nitrogen_toy"
+    load_video_name: "192x192.mp4"
     warn_on_starvation: false
     always_labelled: true
+    ignore_iterator_reset: true
     rand_augmentation:
       fraction_augmented: 1.0
       augmentations:
@@ -79,16 +83,17 @@ stage3_finetune:
         - translation
         - random_blur
         - sharpness
-    n_preprocess_threads_per_gpu: 1
-    preprocessed_chunks_queue_size_per_gpu: 16
-    shuffle_buffer_size_per_gpu: 200
+    n_preprocess_threads_per_gpu: 4
+    preprocessed_chunks_queue_size_per_gpu: 32
+    shuffle_buffer_size_per_gpu: 64
     dataset_worker_num_workers_per_gpu: 1
     dataset_worker_prefetch_factor: 2
-    shuffled_chunks_queue_size_per_gpu: 2
+    shuffled_chunks_queue_size_per_gpu: 4
 
   validation_datasets:
     - batch_size: *stage3_batch_size
       local_prefix: "dataset_nitrogen_toy"
+      load_video_name: "192x192.mp4"
       validation_name: "overall"
       n_preprocess_threads_per_gpu: &validation_stage3_n_preprocess_threads_per_gpu 8
       preprocessed_chunks_queue_size_per_gpu: &validation_stage3_preprocessed_chunks_queue_size_per_gpu 1

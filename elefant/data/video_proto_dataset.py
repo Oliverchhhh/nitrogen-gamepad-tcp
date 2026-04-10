@@ -23,6 +23,7 @@ import torch.multiprocessing as mp
 from abc import ABC, abstractmethod
 from typing import Any, Optional, List
 from torch.utils.data import DataLoader
+from torch.utils.data._utils.collate import default_collate
 import numpy as np
 import pydantic
 import torch
@@ -214,6 +215,16 @@ def _preprocess_example(
         logging.warning(f"Video {proto} has less than 2 frames, skipping.")
         return
 
+    # 加载预计算的 V-JEPA2 表征（如果存在）
+    precomputed_features = None
+    features_path = os.path.join(os.path.dirname(video), "vjepa2_features.pt")
+    if os.path.exists(features_path):
+        try:
+            precomputed_features = torch.load(features_path, map_location="cpu", weights_only=True)
+        except Exception as e:
+            logging.warning(f"Failed to load precomputed features {features_path}: {e}")
+            precomputed_features = None
+
     if config.shuffle:
         # to avoid negative ranges when n_frames < T+1
         max_start = max(0, n_frames - (config.T + 1))
@@ -250,6 +261,18 @@ def _preprocess_example(
             valid_frame_mask=valid_mask,
         )
         if example is not None:
+            # 附加预计算的 V-JEPA2 表征切片
+            if precomputed_features is not None:
+                feat_start = start_frame
+                feat_end = start_frame + config.T
+                n_feat = precomputed_features.shape[0]
+                if feat_end <= n_feat:
+                    chunk_features = precomputed_features[feat_start:feat_end]
+                else:
+                    available = precomputed_features[feat_start:n_feat]
+                    pad = precomputed_features[-1:].expand(feat_end - n_feat, -1)
+                    chunk_features = torch.cat([available, pad], dim=0)
+                example = example._replace(precomputed_vision_features=chunk_features)
             preprocessed_chunks_queue.put(example)
 
         start_frame += stride
@@ -285,6 +308,19 @@ def _preprocess_example(
             valid_frame_mask=valid_mask,
         )
         if example is not None:
+            # 附加预计算的 V-JEPA2 表征切片
+            if precomputed_features is not None:
+                feat_start = start_frame
+                feat_end = start_frame + config.T
+                n_feat = precomputed_features.shape[0]
+                if feat_end <= n_feat:
+                    chunk_features = precomputed_features[feat_start:feat_end]
+                else:
+                    # 边界处理：不足的部分用最后一帧的表征填充
+                    available = precomputed_features[feat_start:n_feat]
+                    pad = precomputed_features[-1:].expand(feat_end - n_feat, -1)
+                    chunk_features = torch.cat([available, pad], dim=0)
+                example = example._replace(precomputed_vision_features=chunk_features)
             preprocessed_chunks_queue.put(example)
     del decoder
 
@@ -591,6 +627,19 @@ class VideoProtoDataset(torch.utils.data.IterableDataset, ABC):
         self._dataset_unique_run_id = dataset_unique_run_id
         self._resolved_dataset_unique_id = f"{self.config.dataset_unique_id}_{dataset_unique_run_id}_{self._dataset_worker_generation}"
 
+        def _collate_fn(batch):
+            """Custom collate that handles None fields (e.g. precomputed_vision_features)."""
+            elem = batch[0]
+            fields = elem._fields
+            collated = {}
+            for field in fields:
+                vals = [getattr(b, field) for b in batch]
+                if vals[0] is None:
+                    collated[field] = None
+                else:
+                    collated[field] = default_collate(vals)
+            return type(elem)(**collated)
+
         def _non_daemonic_worker_init_fn(worker_id):
             dataset_worker_generation = self._dataset_worker_generation
 
@@ -626,6 +675,7 @@ class VideoProtoDataset(torch.utils.data.IterableDataset, ABC):
             timeout=60 * 30,
             persistent_workers=True,
             worker_init_fn=_non_daemonic_worker_init_fn,
+            collate_fn=_collate_fn,
             in_order=False,
         )
 
