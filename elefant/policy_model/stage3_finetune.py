@@ -587,6 +587,9 @@ class PolicyModelTrainer(ModelFreePolicy):
                 action_in_to_tokens_fn=self.action_in_to_tokens,  #real action to tokens时采用, zero action input下real action tokens全0
                 direct_action_head_fn=_direct_head_fn if self._use_gamepad_direct_mapping() else None, #direct action head时采用
             )
+            # PolicyFutureCausalTransformer returns 4 values (extra: future_vision_pred),
+            # base PolicyCausalTransformer returns 3. Unpack generically.
+            sampled_action, idx, kv_cache_state = online_fwd_result[:3]
 
             return sampled_action, idx, kv_cache_state
 
@@ -1846,7 +1849,11 @@ class Stage3FutureVisionLightning(PolicyModelTrainer):
             logging.info("使用预计算 V-JEPA2 表征，跳过加载 state_target_tokenizer")
         else:
             target_tokenizer_cfg = self.config.stage3_finetune.state_target_tokenizer
-            if target_tokenizer_cfg is not None:
+        # state_target_tokenizer is only needed during training to build supervision targets.
+        # Skip initialization in inference_mode to avoid dtype mismatches (its weights are
+        # not saved in the checkpoint and would remain float32 while the rest of the model
+        # runs in bfloat16).
+        if target_tokenizer_cfg is not None and not inference_mode:
                 self.state_target_tokenizer = get_tokenizer(
                     target_tokenizer_cfg,
                     self.config.policy_model.transformer_dim,

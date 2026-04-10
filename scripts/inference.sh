@@ -8,8 +8,11 @@ set -e
 # ============================================================
 # 配置变量（按需修改）
 # ============================================================
-CONFIG_FILE="config/policy_model/150M_local_nitrogen_dataset_future.yaml"
-CHECKPOINT_PATH="202603292053/checkpoint-step=00030000.ckpt"
+# CONFIG_FILE="config/policy_model/150M_local_nitrogen_dataset_future.yaml" #带s0+action预测
+CONFIG_FILE="config/policy_model/150M_local_nitrogen_dataset.yaml" #不带s0，纯action预测
+# CHECKPOINT_PATH="202603292053/checkpoint-step=00030000.ckpt"
+CHECKPOINT_PATH="202604071604_openp2p-gamepad-cuphead_all/checkpoint-step=00300000.ckpt" #纯action预测
+# CHECKPOINT_PATH="202604092016_openp2p-gamepad_cuphead_all_current_GT_vjepa/checkpoint-step=00260000.ckpt" #带s0+action预测
 UDS_PATH="/tmp/uds.recap"
 
 # 推理选项
