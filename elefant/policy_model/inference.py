@@ -1234,7 +1234,11 @@ class InferenceServer(UnixDomainSocketInferenceServer):
         loop = asyncio.get_running_loop()
         reader = asyncio.StreamReader()
         protocol = asyncio.StreamReaderProtocol(reader)
+        try:
         await loop.connect_read_pipe(lambda: protocol, sys.stdin)
+        except Exception as e:
+            logging.warning(f"Could not connect stdin pipe (likely running in Docker): {e}")
+            return
 
         while self.running:
             try:
