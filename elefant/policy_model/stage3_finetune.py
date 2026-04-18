@@ -14,6 +14,7 @@ from elefant.data import (
     ActionLabelVideoProtoDatasetConfig,
     UniversalAutoregressiveActionMapping,
     GamepadAutoregressiveActionMapping,
+    GamepadDirectActionMapping,
     DummyDataset,
     DummyDatasetConfig,
     StructuredAction,
@@ -76,6 +77,26 @@ class GamepadActionLogits(NamedTuple):
     right_stick_y: torch.Tensor
     left_trigger: torch.Tensor
     right_trigger: torch.Tensor
+
+
+class GamepadDirectActionLogits(NamedTuple):
+    """
+    Logits for the direct (non-autoregressive) gamepad head.
+
+    buttons:      [B, T, n_buttons]       binary per-button logits (BCEWithLogits)
+    left_stick_x: [B, T, n_stick_bins]    classification logits
+    left_stick_y: [B, T, n_stick_bins]
+    right_stick_x:[B, T, n_stick_bins]
+    right_stick_y:[B, T, n_stick_bins]
+
+    Triggers excluded: Cuphead never uses trigger inputs
+    (lt=0.037%, rt=0.084% across 5.6M frames — noise only).
+    """
+    buttons: torch.Tensor
+    left_stick_x: torch.Tensor
+    left_stick_y: torch.Tensor
+    right_stick_x: torch.Tensor
+    right_stick_y: torch.Tensor
 
 
 class PolicyModelTrainer(ModelFreePolicy):
@@ -259,7 +280,7 @@ class PolicyModelTrainer(ModelFreePolicy):
         # keys from it(i.e. val_set_names)
         if not self._validation_metrics and self.trainer.val_dataloaders:
             val_set_names = list(self.trainer.val_dataloaders.keys())
-            if self._use_gamepad_mapping():
+            if self._use_gamepad_mapping() or self._use_gamepad_direct_mapping():
                 action_types = [
                     "gamepad_button",
                     "left_stick_x",
@@ -289,8 +310,11 @@ class PolicyModelTrainer(ModelFreePolicy):
     def _use_gamepad_mapping(self) -> bool:
         return isinstance(self.action_mapping, GamepadAutoregressiveActionMapping)
 
+    def _use_gamepad_direct_mapping(self) -> bool:
+        return isinstance(self.action_mapping, GamepadDirectActionMapping)
+
     def _init_metrics(self):
-        if self._use_gamepad_mapping():
+        if self._use_gamepad_mapping() or self._use_gamepad_direct_mapping():
             action_types = [
                 "gamepad_button",
                 "left_stick_x",
@@ -379,6 +403,32 @@ class PolicyModelTrainer(ModelFreePolicy):
             self.gamepad_trigger_out_logits = nn.Linear(
                 embed_dim, self.n_gamepad_trigger_bins
             )
+            return
+
+        # ---- GamepadDirectActionMapping ----
+        if self._use_gamepad_direct_mapping():
+            self.n_direct_buttons = self.action_mapping.get_n_buttons()
+            self.n_direct_stick_bins = self.action_mapping.get_n_stick_bins()
+
+            # MLP: D -> D/2 -> D/4
+            hidden = embed_dim // 2
+            self.direct_action_mlp = nn.Sequential(
+                nn.Linear(embed_dim, hidden, bias=False),
+                nn.SiLU(),
+                nn.Linear(hidden, hidden // 2, bias=False),
+                nn.SiLU(),
+            )
+            mlp_out = hidden // 2
+
+            # 2 independent heads (no trigger head — Cuphead never uses triggers)
+            self.direct_button_head = nn.Linear(mlp_out, self.n_direct_buttons)
+            self.direct_stick_head = nn.Linear(mlp_out, 4 * self.n_direct_stick_bins)
+
+            # Linear projection: action integer vector [seq_len] -> single embedding [D]
+            # Used for real action tokens in transformer (KV cache state refresh)
+            self.direct_action_in_proj = nn.Linear(
+                self.action_mapping.get_seq_len(), embed_dim, bias=False
+            ).to(torch.bfloat16)
             return
 
         # Keyboard actions
@@ -485,6 +535,16 @@ class PolicyModelTrainer(ModelFreePolicy):
                 unif_rand,
             )
 
+        def _direct_head_fn(action_token_out):
+            """Direct mode: a_in^0 [B,1,D] → MLP → 2 heads → sampled action [1, seq_len]."""
+            logits = self.action_out_tokens_to_logits(action_token_out)  # [B, 1, ...]
+            btn_pred = (logits.buttons[0, 0].sigmoid() > 0.5).long()  # [n_buttons]
+            lx = logits.left_stick_x[0, 0].argmax(-1, keepdim=True)
+            ly = logits.left_stick_y[0, 0].argmax(-1, keepdim=True)
+            rx = logits.right_stick_x[0, 0].argmax(-1, keepdim=True)
+            ry = logits.right_stick_y[0, 0].argmax(-1, keepdim=True)
+            return torch.cat([btn_pred, lx, ly, rx, ry], dim=-1).unsqueeze(0)  # [1, seq_len=16]
+
         @(torch.compile(fullgraph=True) if compile else lambda f: f)
         def _predict(frame, idx, kv_cache_state, unif_rand, text_tokens_embed):
             frame = self._normalize_frames(frame)
@@ -507,6 +567,7 @@ class PolicyModelTrainer(ModelFreePolicy):
                 empty_sampled_action_fn=self.action_mapping.make_empty_action,
                 reshape_structured_action_fn=None,
                 action_in_to_tokens_fn=self.action_in_to_tokens,
+                direct_action_head_fn=_direct_head_fn if self._use_gamepad_direct_mapping() else None,
             )
 
             return sampled_action, idx, kv_cache_state
@@ -527,10 +588,19 @@ class PolicyModelTrainer(ModelFreePolicy):
         B, T = frames.shape[0], frames.shape[1]
         action_in = self.action_in_to_tokens(actions)
         action_out, *_ = self.transformer_forward_function(
-            frames, action_in, text_tokens_embed
+            frames, action_in, text_tokens_embed,
+            skip_action_decoder=self._use_gamepad_direct_mapping(),
         )
+        if self._use_gamepad_direct_mapping():
+            # action_out: [B, T, F, D] — take a_in^0 for current frame
+            action_out = action_out[:, :, 0, :]  # [B, T, D]
         action_logits = self.action_out_tokens_to_logits(action_out)
-        if self._use_gamepad_mapping():
+        if self._use_gamepad_direct_mapping():
+            eager_assert(
+                action_logits.buttons.shape,
+                (B, T, self.n_direct_buttons),
+            )
+        elif self._use_gamepad_mapping():
             eager_assert(
                 action_logits.buttons.shape,
                 (B, T, self.n_gamepad_button_actions, self.n_gamepad_button_choices),
@@ -561,6 +631,18 @@ class PolicyModelTrainer(ModelFreePolicy):
             action_logits = self.online_full_predict_logits(
                 frames, actions, text_tokens_embed
             )
+
+            if self._use_gamepad_direct_mapping():
+                btn_pred = (action_logits.buttons.sigmoid() > 0.5).long()
+                lx_idx = action_logits.left_stick_x.argmax(-1, keepdim=True)
+                ly_idx = action_logits.left_stick_y.argmax(-1, keepdim=True)
+                rx_idx = action_logits.right_stick_x.argmax(-1, keepdim=True)
+                ry_idx = action_logits.right_stick_y.argmax(-1, keepdim=True)
+                action_out = torch.cat(
+                    [btn_pred, lx_idx, ly_idx, rx_idx, ry_idx], dim=-1
+                )
+                eager_assert(action_out.shape, (1, T, self.n_actions))
+                return action_out, action_logits
 
             if self._use_gamepad_mapping():
                 button_idx = _sample_from_logits_gpu(
@@ -692,6 +774,18 @@ class PolicyModelTrainer(ModelFreePolicy):
             )
             return action_embedding
 
+        if self._use_gamepad_direct_mapping():
+            # action_in: [B, T, seq_len=18] integer tensor
+            # Project to a single embedding token [B, T, 1, D] for KV cache state refresh.
+            B, T, N = action_in.shape
+            eager_assert(N, self.n_actions)
+            if idx is None:
+                idx = torch.arange(B)
+            selected = action_in[idx].to(dtype=self.direct_action_in_proj.weight.dtype)  # [B', T, 18]
+            action_embedding = self.direct_action_in_proj(selected)  # [B', T, D]
+            action_embedding = action_embedding.unsqueeze(2)  # [B', T, 1, D]
+            return action_embedding
+
         B, T, _ = action_in.keys.shape
         eager_assert(action_in.keys.shape, (B, T, self.n_keyboard_actions))
         eager_assert(action_in.mouse_buttons.shape, (B, T, self.n_mouse_button_actions))
@@ -734,6 +828,21 @@ class PolicyModelTrainer(ModelFreePolicy):
         self, action_out_tokens: torch.Tensor
     ):
         # Any changes here should be reflected in the online_kv_cache_predict function.
+
+        if self._use_gamepad_direct_mapping():
+            # action_out_tokens: [B, T, D] — single a_in^f token per frame
+            feat = self.direct_action_mlp(action_out_tokens)  # [B, T, mlp_out]
+            btn_logits = self.direct_button_head(feat)         # [B, T, n_buttons]
+            stick_logits = self.direct_stick_head(feat)        # [B, T, 4*n_stick_bins]
+
+            S = self.n_direct_stick_bins
+            return GamepadDirectActionLogits(
+                buttons=btn_logits,
+                left_stick_x=stick_logits[:, :, 0*S:1*S],
+                left_stick_y=stick_logits[:, :, 1*S:2*S],
+                right_stick_x=stick_logits[:, :, 2*S:3*S],
+                right_stick_y=stick_logits[:, :, 3*S:4*S],
+            )
 
         B, T, N, D = action_out_tokens.shape
         eager_assert(N, self.n_actions)
@@ -965,6 +1074,56 @@ class PolicyModelTrainer(ModelFreePolicy):
         Compute CE/z auxiliary losses outside torch.compile graph.
         This avoids Triton/Inductor over-fusing large loss expressions.
         """
+        if self._use_gamepad_direct_mapping():
+            # masked_labels: [B, T, seq_len]  seq_len = n_buttons + 4
+            k = self.n_direct_buttons
+            btn_labels = masked_labels[:, :, :k].float()
+            btn_mask = (masked_labels[:, :, :k] != -100).float()
+            btn_logits = action_logits.buttons  # [B, T, k]
+            button_loss = (
+                F.binary_cross_entropy_with_logits(btn_logits, btn_labels.clamp(0), reduction="none")
+                * btn_mask
+            ).sum() / btn_mask.sum().clamp(min=1)
+
+            def _stick_loss(logits, label_slice):
+                return F.cross_entropy(
+                    logits.view(-1, self.n_direct_stick_bins),
+                    label_slice.reshape(-1),
+                    ignore_index=-100,
+                )
+
+            lx_loss = _stick_loss(action_logits.left_stick_x,  masked_labels[:, :, k:k+1])
+            ly_loss = _stick_loss(action_logits.left_stick_y,  masked_labels[:, :, k+1:k+2])
+            rx_loss = _stick_loss(action_logits.right_stick_x, masked_labels[:, :, k+2:k+3])
+            ry_loss = _stick_loss(action_logits.right_stick_y, masked_labels[:, :, k+3:k+4])
+
+            lb_loss = auxiliary_losses.get("lb_loss", btn_logits.new_zeros(()))
+            rz_loss_val = auxiliary_losses.get("rz_loss", btn_logits.new_zeros(()))
+
+            losses = {
+                "gamepad_button": button_loss,
+                "left_stick_x": lx_loss,
+                "left_stick_y": ly_loss,
+                "right_stick_x": rx_loss,
+                "right_stick_y": ry_loss,
+                "lb_loss": lb_loss,
+                "rz_loss": rz_loss_val,
+            }
+            denom_stick = torch.log(torch.tensor(self.n_direct_stick_bins, dtype=torch.float))
+            cross_entropy_loss = (
+                button_loss
+                + lx_loss / denom_stick
+                + ly_loss / denom_stick
+                + rx_loss / denom_stick
+                + ry_loss / denom_stick
+            )
+            loss = (
+                cross_entropy_loss
+                + lb_loss * self.lb_loss_weight
+                + rz_loss_val * self.rz_loss_weight
+            )
+            return loss, cross_entropy_loss, losses
+
         if self._use_gamepad_mapping():
             k = self.n_gamepad_button_actions
             gamepad_button_loss = F.cross_entropy(
@@ -1132,50 +1291,168 @@ class PolicyModelTrainer(ModelFreePolicy):
         )
         return loss, cross_entropy_loss, losses
 
+    def _build_future_masked_labels(self, masked_labels, offset):
+        """Shift masked_labels left by offset frames for future-offset supervision.
+
+        For offset=0 returns masked_labels unchanged.
+        For offset>0 shifts left by offset, padding the last offset positions with -100.
+        masked_labels already has -100 at invalid positions (from effective_mask).
+        """
+        if offset == 0:
+            return masked_labels
+        if self._use_gamepad_mapping() or self._use_gamepad_direct_mapping():
+            # masked_labels: [B, T, n_action_dims]
+            B, T, D = masked_labels.shape
+            valid = masked_labels[:, offset:, :]
+            pad = torch.full((B, offset, D), -100, dtype=masked_labels.dtype, device=masked_labels.device)
+            return torch.cat([valid, pad], dim=1)
+        else:
+            # masked_labels: StructuredAction with fields [B, T, n_dim]
+            def _shift(field):
+                B, T, D = field.shape
+                valid = field[:, offset:, :]
+                pad = torch.full((B, offset, D), -100, dtype=field.dtype, device=field.device)
+                return torch.cat([valid, pad], dim=1)
+            return StructuredAction(
+                keys=_shift(masked_labels.keys),
+                mouse_buttons=_shift(masked_labels.mouse_buttons),
+                mouse_delta_x=_shift(masked_labels.mouse_delta_x),
+                mouse_delta_y=_shift(masked_labels.mouse_delta_y),
+            )
+
     def _calculate_loss(self, batch, actions_in, masked_labels, text_tokens_embed):
         """
         Calculate the loss for the given batch of actions.
-        batch: batch from dataloader
-        actions_in: action sequence correspond to frames, use ground truth action for labeled data and pseudo labels for unlabeled data
-        masked_labels: action sequence masked with user action mask, same as action_in for unlabeled data
+
+        When n_future_action_tokens > 1, we randomly sample future offsets each step:
+          offset[0] = 0 (current frame, always fixed)
+          offset[1] ~ Uniform(1, 9)   -> covers chunk first half
+          offset[2] ~ Uniform(10, 18) -> covers chunk second half
+        Labels beyond T are masked with -100 (no gradient).
         """
         frames = self._normalize_frames(batch.frames)
         batch_size = batch.frames.shape[0]
         T = batch.frames.shape[1]
         action_embeddings_in = self.action_in_to_tokens(actions_in)
+        n_emb_tokens = self.transformer_n_action_tokens if self._use_gamepad_direct_mapping() else self.n_actions
         eager_assert(
             action_embeddings_in.shape,
             (
                 batch_size,
                 T,
-                self.n_actions,
-                self.config.policy_model.action_decoder.embed_dim,
-            ),
-        )
-        action_out_embeddings, _, auxiliary_losses, auxiliary_outputs = (
-            self.transformer_forward_function(
-                frames, action_embeddings_in, text_tokens_embed
-            )
-        )
-        eager_assert(
-            action_out_embeddings.shape,
-            (
-                batch_size,
-                T,
-                self.n_actions,
+                n_emb_tokens,
                 self.config.policy_model.action_decoder.embed_dim,
             ),
         )
 
-        action_logits = self.action_out_tokens_to_logits(action_out_embeddings)
-        loss, cross_entropy_loss, losses = self._calculate_action_losses_from_logits_eager(
-            action_logits=action_logits,
-            masked_labels=masked_labels,
-            auxiliary_losses=auxiliary_losses,
-            batch_size=batch_size,
-            T=T,
+        F = self.config.policy_model.n_future_action_tokens
+
+        # Sample random future offsets for this training step
+        if F == 1:
+            future_offsets = [0]
+        else:
+            # offset[0] always 0 (current frame)
+            # remaining F-1 offsets randomly sampled from [1, chunk_size],
+            # uniformly partitioned to ensure coverage across the full chunk.
+            # When F-1 >= chunk_size, partition=1 and offsets become consecutive [0..F-1].
+            chunk_size = 18
+            n_future = F - 1
+            if n_future >= chunk_size:
+                # F covers entire chunk: use consecutive offsets 1..chunk_size
+                # any extra beyond chunk_size also consecutive (edge case)
+                future_offsets = list(range(F))
+            else:
+                partition = chunk_size // n_future
+                future_offsets = [0]
+                for i in range(n_future):
+                    lo = i * partition + 1
+                    hi = min((i + 1) * partition, chunk_size)
+                    offset = torch.randint(lo, hi + 1, (1,)).item()
+                    future_offsets.append(offset)
+
+        action_out_embeddings, _, auxiliary_losses, auxiliary_outputs = (
+            self.transformer_forward_function(
+                frames, action_embeddings_in, text_tokens_embed,
+                future_offsets=future_offsets,
+                skip_action_decoder=self._use_gamepad_direct_mapping(),
+            )
         )
-        return loss, cross_entropy_loss, losses, auxiliary_outputs
+
+        if self._use_gamepad_direct_mapping():
+            # action_out_embeddings: [B, T, F, D] — raw a_in^f transformer outputs
+            total_loss = None
+            total_ce_loss = None
+            total_losses = {}
+            for i, offset in enumerate(future_offsets):
+                labels_i = self._build_future_masked_labels(masked_labels, offset)
+                a_in_f = action_out_embeddings[:, :, i, :]  # [B, T, D]
+                action_logits_i = self.action_out_tokens_to_logits(a_in_f)
+                aux = auxiliary_losses if i == 0 else {}
+                loss_i, ce_i, losses_i = self._calculate_action_losses_from_logits_eager(
+                    action_logits=action_logits_i,
+                    masked_labels=labels_i,
+                    auxiliary_losses=aux,
+                    batch_size=batch_size,
+                    T=T,
+                )
+                if total_loss is None:
+                    total_loss = loss_i
+                    total_ce_loss = ce_i
+                    total_losses = {k: v for k, v in losses_i.items()}
+                else:
+                    total_loss = total_loss + loss_i
+                    total_ce_loss = total_ce_loss + ce_i
+                    for k, v in losses_i.items():
+                        total_losses[k] = total_losses.get(k, 0) + v
+            total_loss = total_loss / F
+            total_ce_loss = total_ce_loss / F
+            total_losses = {k: v / F for k, v in total_losses.items()}
+            return total_loss, total_ce_loss, total_losses, auxiliary_outputs
+
+        if F == 1:
+            # Legacy single-frame path
+            action_out_f0 = action_out_embeddings[:, :, 0, :, :]
+            action_logits = self.action_out_tokens_to_logits(action_out_f0)
+            loss, cross_entropy_loss, losses = self._calculate_action_losses_from_logits_eager(
+                action_logits=action_logits,
+                masked_labels=masked_labels,
+                auxiliary_losses=auxiliary_losses,
+                batch_size=batch_size,
+                T=T,
+            )
+            return loss, cross_entropy_loss, losses, auxiliary_outputs
+
+        # Multi-future path: action_out_embeddings [B, T, F, n_actions-1, D]
+        total_loss = None
+        total_ce_loss = None
+        total_losses = {}
+        for i, offset in enumerate(future_offsets):
+            labels_i = self._build_future_masked_labels(masked_labels, offset)
+            action_out_i = action_out_embeddings[:, :, i, :, :]  # [B, T, n_actions-1, D]
+            action_logits_i = self.action_out_tokens_to_logits(action_out_i)
+            # auxiliary_losses only applied once (i=0) to avoid double-counting
+            aux = auxiliary_losses if i == 0 else {}
+            loss_i, ce_i, losses_i = self._calculate_action_losses_from_logits_eager(
+                action_logits=action_logits_i,
+                masked_labels=labels_i,
+                auxiliary_losses=aux,
+                batch_size=batch_size,
+                T=T,
+            )
+            if total_loss is None:
+                total_loss = loss_i
+                total_ce_loss = ce_i
+                total_losses = {k: v for k, v in losses_i.items()}
+            else:
+                total_loss = total_loss + loss_i
+                total_ce_loss = total_ce_loss + ce_i
+                for k, v in losses_i.items():
+                    total_losses[k] = total_losses.get(k, 0) + v
+
+        total_loss = total_loss / F
+        total_ce_loss = total_ce_loss / F
+        total_losses = {k: v / F for k, v in total_losses.items()}
+        return total_loss, total_ce_loss, total_losses, auxiliary_outputs
 
     def _create_target_and_masked_labels(self, batch):
         batch_size = batch.frames.shape[0]
@@ -1193,7 +1470,7 @@ class PolicyModelTrainer(ModelFreePolicy):
             user_action_mask, valid_frame_mask, system_action_mask
         )
         actions_in = batch.action_annotations
-        if self._use_gamepad_mapping():
+        if self._use_gamepad_mapping() or self._use_gamepad_direct_mapping():
             masked_labels = torch.where(
                 effective_mask.unsqueeze(2),
                 batch.action_annotations,
@@ -1320,7 +1597,7 @@ class PolicyModelTrainer(ModelFreePolicy):
         # Accumulation gets weird at the end of the epoch.
         # if self.trainer.fit_loop.epoch_loop._accumulated_batches_reached():
         # TODO: proper fix, right not gradient accumulation does not work with DDP.
-        if self.trainer.global_step % 50 == 0:
+        if self.trainer.global_step % 50 == 0: #每隔50步更新
             self.log(
                 "training_loss",
                 self._training_loss_metric.compute(),
@@ -1645,6 +1922,14 @@ class Stage3FutureVisionLightning(PolicyModelTrainer):
     @dynamo.disable
     def _calculate_action_loss_from_logits(self, action_logits, masked_labels, auxiliary_losses):
         """Calculate action loss from precomputed logits for both mapping types."""
+        if self._use_gamepad_direct_mapping():
+            # Reuse the parent class eager loss which already handles direct mapping
+            loss, ce_loss, losses = self._calculate_action_losses_from_logits_eager(
+                action_logits, masked_labels, auxiliary_losses,
+                masked_labels.shape[0], masked_labels.shape[1],
+            )
+            return loss, losses
+
         if self._use_gamepad_mapping():
             k = self.n_gamepad_button_actions
             gamepad_button_loss = F.cross_entropy(
@@ -1901,18 +2186,26 @@ class Stage3FutureVisionLightning(PolicyModelTrainer):
                     frames,
                     action_embeddings_in,
                     text_tokens_embed,
+                    skip_action_decoder=self._use_gamepad_direct_mapping(),
                 )
             )
 
-            eager_assert(
-                action_out_embeddings.shape,
-                (
-                    batch_size,
-                    T,
-                    self.n_actions,
-                    self.config.policy_model.action_decoder.embed_dim,
-                ),
-            )
+            if self._use_gamepad_direct_mapping():
+                # action_out_embeddings: [B, T, 1, D] (F=1 for this transformer)
+                eager_assert(
+                    action_out_embeddings.shape,
+                    (batch_size, T, 1, self.config.policy_model.transformer_dim),
+                )
+            else:
+                eager_assert(
+                    action_out_embeddings.shape,
+                    (
+                        batch_size,
+                        T,
+                        self.transformer_n_action_tokens,
+                        self.config.policy_model.action_decoder.embed_dim,
+                    ),
+                )
             eager_assert(
                 future_vision_pred.shape,
                 (
@@ -1938,7 +2231,11 @@ class Stage3FutureVisionLightning(PolicyModelTrainer):
         future_vision_loss = F.mse_loss(future_vision_pred, future_vision_target)
 
         # Keep complex action CE/z-loss in eager mode to avoid over-fusion/compile failures.
-        action_logits = self.action_out_tokens_to_logits(action_out_embeddings)
+        if self._use_gamepad_direct_mapping():
+            # action_out_embeddings: [B, T, 1, D] -> [B, T, D]
+            action_logits = self.action_out_tokens_to_logits(action_out_embeddings[:, :, 0, :])
+        else:
+            action_logits = self.action_out_tokens_to_logits(action_out_embeddings)
         action_loss, losses = self._calculate_action_loss_from_logits(
             action_logits, masked_labels, auxiliary_losses
         )
@@ -1979,7 +2276,8 @@ class Stage3FutureVisionLightning(PolicyModelTrainer):
 
             action_out_embeddings, _, future_vision_pred, auxiliary_losses, auxiliary_outputs = (
                 self.transformer_forward_function(
-                    frames, action_embeddings_in, text_tokens_embed
+                    frames, action_embeddings_in, text_tokens_embed,
+                    skip_action_decoder=self._use_gamepad_direct_mapping(),
                 )
             )
 
@@ -1998,7 +2296,10 @@ class Stage3FutureVisionLightning(PolicyModelTrainer):
             precomputed_vision_features=precomputed_feats,
         )
         future_vision_loss = F.mse_loss(future_vision_pred, future_vision_target)
-        action_logits = self.action_out_tokens_to_logits(action_out_embeddings)
+        if self._use_gamepad_direct_mapping():
+            action_logits = self.action_out_tokens_to_logits(action_out_embeddings[:, :, 0, :])
+        else:
+            action_logits = self.action_out_tokens_to_logits(action_out_embeddings)
         action_loss, losses = self._calculate_action_loss_from_logits(
             action_logits, masked_labels, auxiliary_losses
         )
@@ -2318,7 +2619,7 @@ def train_stage3_finetune(config: LightningPolicyConfig):
     if torch.cuda.device_count() > 1:
         logging.info(f"Using DDP strategy with {torch.cuda.device_count()} GPUs")
         strategy = pl.pytorch.strategies.DDPStrategy(
-            find_unused_parameters=False,
+            find_unused_parameters=config.shared.action_mapping_type == "gamepad_direct",
             timeout=timedelta(seconds=7200),
         )
     else:
@@ -2432,7 +2733,7 @@ def train_stage3_future_vision(config: LightningPolicyConfig):
     if torch.cuda.device_count() > 1:
         logging.info(f"Using DDP strategy with {torch.cuda.device_count()} GPUs")
         strategy = pl.pytorch.strategies.DDPStrategy(
-            find_unused_parameters=False,
+            find_unused_parameters=config.shared.action_mapping_type == "gamepad_direct",
             timeout=timedelta(seconds=7200),
         )
     else:

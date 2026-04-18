@@ -315,11 +315,11 @@ class KVCacheInferenceState(BaseInferenceState):
                 frame_to_process = frame.unsqueeze(0)  # [1, C, H, W] -> [1, 1, C, H, W]
             else:
                 # 非 V-JEPA 2 tokenizer，直接使用单帧
-                # frame 形状: [C, H, W] 或 [1, C, H, W]
-                if frame.dim() == 3:
-                    frame_to_process = frame.unsqueeze(0).unsqueeze(0)  # [C, H, W] -> [1, 1, C, H, W]
+                # _predict 内部会做 unsqueeze(0).unsqueeze(0)，所以这里保持 [C, H, W]
+                if frame.dim() == 4:
+                    frame_to_process = frame.squeeze(0)  # [1, C, H, W] -> [C, H, W]
                 else:
-                    frame_to_process = frame.unsqueeze(0)  # [1, C, H, W] -> [1, 1, C, H, W]
+                    frame_to_process = frame  # 已经是 [C, H, W]
             
             action_tensor, self.idx, self.kv_cache_state = (
                 self.model.online_kv_cache_predict(
@@ -640,15 +640,31 @@ class InferenceServer(UnixDomainSocketInferenceServer):
                             for k in incompatible.missing_keys
                             if not k.startswith("state_target_tokenizer.")
                         ]
-                        if disallowed_missing or incompatible.unexpected_keys:
+                        # Checkpoints saved with bf16-mixed training store weights as float32.
+                        # After load_state_dict the model is float32 on CPU; move to GPU and cast
+                        # to bfloat16 so it matches the inference input tensors.
+                        self.model.to(device=f"cuda:{self.device_idx}", dtype=torch.bfloat16)
+                        # Some checkpoints duplicate image_tokenizer keys at the top level
+                        # (image_tokenizer.*) in addition to bc_transformer.image_tokenizer.*.
+                        # These are unexpected but harmless — filter them out before raising.
+                        disallowed_unexpected = [
+                            k
+                            for k in incompatible.unexpected_keys
+                            if not k.startswith("image_tokenizer.")
+                        ]
+                        if disallowed_missing or disallowed_unexpected:
                             raise RuntimeError(
                                 "Checkpoint incompatibility for Stage3FutureVisionLightning. "
                                 f"disallowed_missing={disallowed_missing}, "
-                                f"unexpected={list(incompatible.unexpected_keys)}"
+                                f"unexpected={disallowed_unexpected}"
                             )
                         if incompatible.missing_keys:
                             logging.warning(
                                 "Ignored missing state_target_tokenizer keys (frozen, not needed for inference)"
+                            )
+                        if incompatible.unexpected_keys:
+                            logging.warning(
+                                "Ignored duplicate top-level image_tokenizer keys in checkpoint"
                             )
                     else:
                         self.model = Stage3LabelledBCLightning.load_from_checkpoint(

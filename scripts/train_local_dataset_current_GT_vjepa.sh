@@ -5,7 +5,7 @@ set -e  # 遇到错误立即退出
 
 # 配置变量
 CONFIG_FILE="config/policy_model/150M_local_nitrogen_dataset_current.yaml"
-DATA_FOLDER="cuphead_dataset_converted"  # 数据集路径（相对于项目根目录）
+DATA_FOLDER="cuphead_one_level"  # 数据集路径（相对于项目根目录）
 OUTPUT_DIR="output/policy_model/150M_nitrogen_cuphead_all_current_gt_vjepa2"  # 默认输出目录（覆盖 shared.output_path）；可用 -o 覆盖
 TEMP_CONFIG_FILE=""
 NO_COMPILE=false

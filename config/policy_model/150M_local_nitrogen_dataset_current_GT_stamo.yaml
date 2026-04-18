@@ -6,9 +6,9 @@ shared:
   action_mapping_type: "gamepad"
   gamepad_action_mapping:
     max_buttons: 6
-    n_stick_bins: 33
+    n_stick_bins: 3
     n_trigger_bins: 17
-    stick_deadzone: 0.05
+    stick_deadzone: 0.15
   text_tokenizer_config:
     text_tokenizer_name: "gemma"
     text_embedding_shape: [1, 768]

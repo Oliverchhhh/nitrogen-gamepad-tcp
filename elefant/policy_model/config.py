@@ -6,7 +6,10 @@ from elefant.data import (
     RandAugmentationConfig,
     UniversalAutoregressiveActionMappingConfig,
 )
-from elefant.data.action_mapping import GamepadAutoregressiveActionMappingConfig
+from elefant.data.action_mapping import (
+    GamepadAutoregressiveActionMappingConfig,
+    GamepadDirectActionMappingConfig,
+)
 from elefant.config import WandbConfig
 from elefant.im_tokenizer.config import ImageTokenizerConfig
 from elefant.text_tokenizer.config import TextTokenizerConfig
@@ -88,6 +91,7 @@ class PolicyModelConfig(TransformerModelConfig):
     n_kv_sink_tokens: int = 1
     top_p: Optional[float] = None
     z_loss_weight: float = 1e-4
+    n_future_action_tokens: int = 1
 
 
 class AdamWOptimConfig(ConfigBase):
@@ -209,9 +213,12 @@ class SharedConfig(ConfigBase):
     action_mapping: UniversalAutoregressiveActionMappingConfig = (
         UniversalAutoregressiveActionMappingConfig()
     )
-    action_mapping_type: Literal["keyboard_mouse", "gamepad"] = "keyboard_mouse"
+    action_mapping_type: Literal["keyboard_mouse", "gamepad", "gamepad_direct"] = "keyboard_mouse"
     gamepad_action_mapping: GamepadAutoregressiveActionMappingConfig = (
         GamepadAutoregressiveActionMappingConfig()
+    )
+    gamepad_direct_action_mapping: GamepadDirectActionMappingConfig = (
+        GamepadDirectActionMappingConfig()
     )
 
 

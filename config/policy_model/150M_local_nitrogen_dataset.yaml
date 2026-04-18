@@ -6,9 +6,9 @@ shared:
   action_mapping_type: "gamepad"
   gamepad_action_mapping:
     max_buttons: 6
-    n_stick_bins: 33
+    n_stick_bins: 3
     n_trigger_bins: 17
-    stick_deadzone: 0.05
+    stick_deadzone: 0.15
   text_tokenizer_config:
     text_tokenizer_name: "gemma"
     text_embedding_shape: [1, 768]
@@ -45,7 +45,7 @@ stage3_finetune:
 
   validation_step_interval: 999999  # 设置极大值，训练期间不触发 validation
   n_validation_steps: &n_validation_steps 0  # 0 步 = 跳过 validation
-  save_every_n_steps: 50000  # 每 50000 步保存一次检查点
+  save_every_n_steps: 10000  # 每 10000 步保存一次检查点
   n_training_steps: 500000  # 训练总步数
   accumulate_grad_batches: 1
 

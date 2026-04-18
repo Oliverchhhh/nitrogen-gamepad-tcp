@@ -2,6 +2,7 @@ import lightning as pl
 from elefant.data.action_mapping import (
     UniversalAutoregressiveActionMapping,
     GamepadAutoregressiveActionMapping,
+    GamepadDirectActionMapping,
 )
 from elefant.policy_model.config import LightningPolicyConfig
 from elefant.im_tokenizer.config import ImageTokenizerConfig
@@ -36,13 +37,22 @@ class ModelFreePolicy(pl.LightningModule):
             self.action_mapping = GamepadAutoregressiveActionMapping(
                 config=self.config.shared.gamepad_action_mapping
             )
+        elif getattr(self.config.shared, "action_mapping_type", "keyboard_mouse") == "gamepad_direct":
+            self.action_mapping = GamepadDirectActionMapping(
+                config=self.config.shared.gamepad_direct_action_mapping
+            )
         else:
             self.action_mapping = UniversalAutoregressiveActionMapping(
                 config=self.config.shared.action_mapping
             )
 
         # for stage2 and stage3 policy model, the model attend to real actions
-        self.transformer_n_action_tokens = self.action_mapping.get_seq_len()
+        # For gamepad_direct, real action tokens = 1 (single projected embedding),
+        # since we skip ActionDecoder and only need it for KV cache state refresh.
+        if isinstance(self.action_mapping, GamepadDirectActionMapping):
+            self.transformer_n_action_tokens = 1
+        else:
+            self.transformer_n_action_tokens = self.action_mapping.get_seq_len()
         self.text_token_size = (
             self.config.shared.text_tokenizer_config.text_embedding_shape[0]
         )
@@ -88,6 +98,7 @@ class ModelFreePolicy(pl.LightningModule):
                 mask_fn=self._get_transformer_mask_fn(),
             )
         else:
+            _is_direct = isinstance(self.action_mapping, GamepadDirectActionMapping)
             self.bc_transformer = PolicyCausalTransformer(
                 config=PolicyCausalTransformerConfig(
                     embed_dim=config.policy_model.transformer_dim,
@@ -101,11 +112,13 @@ class ModelFreePolicy(pl.LightningModule):
                     model_type=config.policy_model.model_type,
                     action_decoder=ActionDecoderConfig(
                         embed_dim=config.policy_model.action_decoder.embed_dim,
-                        n_action_tokens=self.action_mapping.get_seq_len() + 1,
+                        n_action_tokens=self.transformer_n_action_tokens + 1,
                         input_action_token_dim=config.policy_model.transformer_dim,
                     ),
                     n_kv_sink_tokens=config.policy_model.n_kv_sink_tokens,
                     n_action_tokens=self.transformer_n_action_tokens,
+                    n_future_action_tokens=config.policy_model.n_future_action_tokens,
+                    skip_action_decoder=_is_direct,
                     text_token_size=self.text_token_size,
                     text_tokenizer_embed_dim=self.text_tokenizer_embed_dim,
                 ),

@@ -80,7 +80,8 @@ class GamepadActionMetrics:
         self.n_stick_bins = n_stick_bins
         self.n_trigger_bins = n_trigger_bins
         self.stick_center = n_stick_bins // 2
-        self.stick_dz_half = stick_deadzone_half  # center ± dz_half 视为死区
+        # For 3-bin sticks (left/neutral/right), only the center bin is deadzone.
+        self.stick_dz_half = 0 if n_stick_bins <= 3 else stick_deadzone_half  # center ± dz_half 视为死区
 
         # 按钮
         self.button_correct = _RunningMean()

@@ -9,6 +9,8 @@ from elefant.data.action_mapping import (
     UniversalAutoregressiveActionMappingConfig,
     GamepadAutoregressiveActionMapping,
     GamepadAutoregressiveActionMappingConfig,
+    GamepadDirectActionMapping,
+    GamepadDirectActionMappingConfig,
     StructuredAction,
 )
 from elefant.data.video_proto_dataset import (
@@ -27,6 +29,8 @@ __all__ = [
     "UniversalAutoregressiveActionMapping",
     "GamepadAutoregressiveActionMapping",
     "GamepadAutoregressiveActionMappingConfig",
+    "GamepadDirectActionMapping",
+    "GamepadDirectActionMappingConfig",
     "DummyDataset",
     "DummyDatasetConfig",
 ]

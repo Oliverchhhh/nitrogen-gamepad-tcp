@@ -9,6 +9,8 @@ from elefant.data.action_mapping import (
     UniversalAutoregressiveActionMappingConfig,
     GamepadAutoregressiveActionMapping,
     GamepadAutoregressiveActionMappingConfig,
+    GamepadDirectActionMapping,
+    GamepadDirectActionMappingConfig,
 )
 from elefant.data.environment_mapping import ENVIRONMENT_MAPPING
 from elefant.data.video_proto_dataset import (
@@ -30,7 +32,11 @@ class ActionLabelVideoProtoDatasetConfig(VideoProtoDatasetConfig):
     gamepad_action_mapping: Optional[
         GamepadAutoregressiveActionMappingConfig
     ] = None
-    # Which action mapping to use: "keyboard_mouse" (default) or "gamepad".
+    # Optional direct gamepad action mapping config (no ActionDecoder).
+    gamepad_direct_action_mapping: Optional[
+        GamepadDirectActionMappingConfig
+    ] = None
+    # Which action mapping to use: "keyboard_mouse" (default), "gamepad", or "gamepad_direct".
     action_mapping_type: str = "keyboard_mouse"
 
     drop_chunks_with_only_system_actions: bool = False
@@ -172,8 +178,8 @@ class ActionLabelAnnotationParser(ProtoParser):
             size=(n_frames,), fill_value=env_subenv_encoding, dtype=torch.long
         )
         if self.frame_annotations is not None:
-            # Branch on the type of action mapping: keyboard+mouse vs gamepad.
-            if isinstance(self.action_mapping, GamepadAutoregressiveActionMapping):
+            # Branch on the type of action mapping: keyboard+mouse vs gamepad vs gamepad_direct.
+            if isinstance(self.action_mapping, (GamepadAutoregressiveActionMapping, GamepadDirectActionMapping)):
                 # Gamepad path: use GamePadAction and map to a (T, seq_len) token tensor.
                 action_annotations = self.action_mapping.make_empty_action(n_frames)
                 user_action_mask = torch.zeros(n_frames, dtype=torch.bool)
@@ -312,15 +318,21 @@ class ActionLabelVideoProtoDataset(VideoProtoDataset):
         super().__init__(*args, **kwargs)
         self.dataloader = None
         # Choose the appropriate action mapping based on config.
-        if getattr(self.config, "action_mapping_type", "keyboard_mouse") == "gamepad":
+        action_mapping_type = getattr(self.config, "action_mapping_type", "keyboard_mouse")
+        if action_mapping_type == "gamepad":
             gamepad_cfg = (
                 self.config.gamepad_action_mapping
                 if self.config.gamepad_action_mapping is not None
                 else GamepadAutoregressiveActionMappingConfig()
             )
-            self.action_mapping = GamepadAutoregressiveActionMapping(
-                config=gamepad_cfg
+            self.action_mapping = GamepadAutoregressiveActionMapping(config=gamepad_cfg)
+        elif action_mapping_type == "gamepad_direct":
+            direct_cfg = (
+                self.config.gamepad_direct_action_mapping
+                if self.config.gamepad_direct_action_mapping is not None
+                else GamepadDirectActionMappingConfig()
             )
+            self.action_mapping = GamepadDirectActionMapping(config=direct_cfg)
         else:
             self.action_mapping = UniversalAutoregressiveActionMapping(
                 config=self.config.action_mapping

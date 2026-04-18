@@ -1,0 +1,87 @@
+shared:
+  output_path: output/policy_model/150M_nitrogen_cuphead_future_action_direct_F18_2head
+  n_seq_timesteps: 200
+  frame_height: 192
+  frame_width: 192
+  action_mapping_type: "gamepad_direct"
+  gamepad_direct_action_mapping:
+    n_stick_bins: 3
+    stick_deadzone: 0.15
+  text_tokenizer_config:
+    text_tokenizer_name: "gemma"
+    text_embedding_shape: [1, 768]
+    text_annotation_model_version: ["gemini-2.5-flash", "gemini-2.5-flash-thinking-0905"]
+  tokenizer:
+    type: "conv"
+    conv_tokenizer_config:
+      num_tokens: 1
+
+inference:
+  mouse_sampling_approach: "truncated_normal"
+
+# Policy Model Configuration
+policy_model:
+  n_transformer_layers: 10
+  n_q_head: 16
+  n_kv_head: 16
+  n_thinking_tokens: 1
+  transformer_dim: &transformer_dim 1024
+  mask_block_size: 128
+  attention_history_len: [200, 200, 200, 200, 200, 200, 200, 200, 200, 200]
+  n_kv_sink_tokens: 0
+  model_type: "dense"
+  # direct 模式：a_in^0 预测当前帧，a_in^1..a_in^{F-1} 随机采样未来 18 帧 chunk
+  # ActionDecoder 被跳过，a_in^f 直接经 MLP → 2 head 解码（button BCE + stick CE，无扳机）
+  n_future_action_tokens: 18
+  action_decoder:
+    embed_dim: *transformer_dim
+
+
+stage3_finetune:
+  optim:
+    learning_rate: 0.0001
+    weight_decay: 0.0001
+    beta_1: 0.9
+    beta_2: 0.999
+
+  validation_step_interval: 999999
+  n_validation_steps: &n_validation_steps 0
+  save_every_n_steps: 10000
+  n_training_steps: 500000
+  accumulate_grad_batches: 1
+
+  training_dataset:
+    batch_size: &stage3_batch_size 2
+    local_prefix: "cuphead_dataset_converted"
+    load_video_name: "192x192.mp4"
+    warn_on_starvation: false
+    always_labelled: true
+    rand_augmentation:
+      fraction_augmented: 1.0
+      augmentations:
+        - "color"
+        - "planckian"
+        - "iso_noise"
+        - "random_blur"
+    n_preprocess_threads_per_gpu: 2
+    preprocessed_chunks_queue_size_per_gpu: 8
+    shuffled_chunks_queue_size_per_gpu: 4
+    dataset_worker_prefetch_factor: 2
+
+  validation_dataset:
+    batch_size: &validation_stage3_batch_size 2
+    local_prefix: "cuphead_dataset_converted"
+    load_video_name: "192x192.mp4"
+    n_preprocess_threads_per_gpu: &validation_stage3_n_preprocess_threads_per_gpu 8
+    preprocessed_chunks_queue_size_per_gpu: &validation_stage3_preprocessed_chunks_queue_size_per_gpu 1
+    shuffled_chunks_queue_size_per_gpu: &validation_stage3_shuffled_chunks_queue_size 1
+    dataset_worker_prefetch_factor: &validation_stage3_dataset_worker_prefetch_factor 8
+    warn_on_starvation: false
+    always_labelled: true
+
+
+wandb:
+  enabled: True
+  entity: "zjut-cv"
+  project: "policy_model"
+  exp_name: "150M-nitrogen-cuphead-future-action-direct-F18-2head"

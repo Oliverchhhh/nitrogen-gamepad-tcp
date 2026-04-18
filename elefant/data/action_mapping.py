@@ -657,10 +657,10 @@ class GamepadAutoregressiveActionMappingConfig(ConfigBase):
 
     # Number of bins for stick axes in [-1, 1].
     n_stick_bins: int = pydantic.Field(
-        default=33,
+        default=3,
         ge=3,
         description="Number of quantization bins for stick axes in [-1, 1]",
-    )#将手柄的x,y轴的值量化为33个bins
+    )#将手柄的x,y轴的值量化为3个bins（-1/0/+1）
 
     # Number of bins for trigger values in [0, 1].
     n_trigger_bins: int = pydantic.Field(
@@ -671,11 +671,11 @@ class GamepadAutoregressiveActionMappingConfig(ConfigBase):
 
     # Deadzone for sticks before quantization.
     stick_deadzone: float = pydantic.Field(
-        default=0.05,
+        default=0.15,
         ge=0.0,
         le=1.0,
         description="Deadzone for stick axes; values with abs(x) < deadzone are mapped to 0",
-    )#手柄的x,y轴的值量化为33个bins时，当值小于0.05时，映射为0，减少抖动
+    )#手柄x,y轴量化前 deadzone，小于该阈值先归零，减少抖动
 
 
 # Button vocabulary for gamepad actions.
@@ -769,6 +769,15 @@ class GamepadAutoregressiveActionMapping:
     def _quantize_stick(self, value: float) -> int:
         """Quantize a stick axis value in [-1, 1] to [0, n_stick_bins-1]."""
         v = max(-1.0, min(1.0, float(value)))
+        # Cuphead-like control is fundamentally directional.
+        # For 3 bins we enforce explicit {-1, 0, +1} quantization by deadzone.
+        if self.config.n_stick_bins == 3:
+            if v > self.config.stick_deadzone:
+                return 2
+            if v < -self.config.stick_deadzone:
+                return 0
+            return 1
+
         if abs(v) < self.config.stick_deadzone:
             v = 0.0
         # Map [-1,1] -> [0,1]
@@ -913,5 +922,202 @@ class GamepadAutoregressiveActionMapping:
             "stick_deadzone": self.config.stick_deadzone,
             "button_encoding_map": deepcopy(GAMEPAD_BUTTON_ENCODING_MAP),
             "button_order": deepcopy(GAMEPAD_BUTTON_ORDER),
+        }
+        return json.dumps(data)
+
+
+# ---------------------------------------------------------------------------
+# GamepadDirectActionMapping
+# ---------------------------------------------------------------------------
+# Buttons actually observed in Cuphead data (left_thumb / right_thumb never used).
+CUPHEAD_BUTTON_VOCAB = [
+    "south",
+    "north",
+    "east",
+    "west",
+    "dpad_up",
+    "dpad_down",
+    "dpad_left",
+    "dpad_right",
+    "start",
+    "select",
+    "left_bumper",
+    "right_bumper",
+]
+
+# Index in the multi-label button vector for each button name.
+CUPHEAD_BUTTON_TO_IDX = {name: i for i, name in enumerate(CUPHEAD_BUTTON_VOCAB)}
+
+
+class GamepadDirectActionMappingConfig(ConfigBase):
+    """
+    Configuration for the direct (non-autoregressive) gamepad action head.
+
+    Each frame is represented as a flat integer tensor of shape (seq_len,):
+        [btn_0, ..., btn_{K-1}, lx, ly, rx, ry]
+
+    where btn_i in {0, 1} (binary per-button), and axes are quantized indices.
+    seq_len = len(CUPHEAD_BUTTON_VOCAB) + 4
+
+    Triggers are excluded: Cuphead never uses trigger inputs.
+    """
+
+    n_stick_bins: int = pydantic.Field(
+        default=3,
+        ge=3,
+        description="Quantization bins for stick axes in [-1, 1]",
+    )
+    stick_deadzone: float = pydantic.Field(
+        default=0.15,
+        ge=0.0,
+        le=1.0,
+        description="Deadzone for stick axes before quantization",
+    )
+
+
+class GamepadDirectActionMapping:
+    """
+    Direct (non-autoregressive) gamepad action mapping.
+
+    Token layout per frame (flat integer tensor, shape (seq_len,)):
+        [btn_0, ..., btn_{K-1}, lx, ly, rx, ry]
+
+    - btn_i in {0, 1}: whether button i (from CUPHEAD_BUTTON_VOCAB) is pressed
+    - lx, ly, rx, ry: quantized stick axes in [0, n_stick_bins-1]
+
+    Triggers are excluded: Cuphead does not use trigger inputs
+    (verified across 5.6M dataset frames: lt=0.037%, rt=0.084% — noise only).
+    """
+
+    def __init__(self, config: Optional[GamepadDirectActionMappingConfig] = None):
+        if config is None:
+            config = GamepadDirectActionMappingConfig()
+        self.config = config
+        self.n_buttons = len(CUPHEAD_BUTTON_VOCAB)
+
+    # ------------------------------------------------------------------
+    # Layout helpers
+    # ------------------------------------------------------------------
+
+    def get_n_buttons(self) -> int:
+        return self.n_buttons
+
+    def get_n_stick_bins(self) -> int:
+        return self.config.n_stick_bins
+
+    def get_seq_len(self) -> int:
+        """Total token length: n_buttons + 4 sticks (no triggers)."""
+        return self.n_buttons + 4
+
+    # ------------------------------------------------------------------
+    # Quantization helpers (reuse same logic as GamepadAutoregressiveActionMapping)
+    # ------------------------------------------------------------------
+
+    def _quantize_stick(self, value: float) -> int:
+        v = max(-1.0, min(1.0, float(value)))
+        if self.config.n_stick_bins == 3:
+            if v > self.config.stick_deadzone:
+                return 2
+            if v < -self.config.stick_deadzone:
+                return 0
+            return 1
+        if abs(v) < self.config.stick_deadzone:
+            v = 0.0
+        v01 = (v + 1.0) / 2.0
+        idx = int(round(v01 * (self.config.n_stick_bins - 1)))
+        return max(0, min(self.config.n_stick_bins - 1, idx))
+
+    def _quantize_trigger(self, value: float) -> int:
+        v = max(0.0, min(1.0, float(value)))
+        idx = int(round(v * (self.config.n_trigger_bins - 1)))
+        return max(0, min(self.config.n_trigger_bins - 1, idx))
+
+    def _dequantize_stick(self, idx: int) -> float:
+        i = max(0, min(self.config.n_stick_bins - 1, int(idx)))
+        if self.config.n_stick_bins <= 1:
+            return 0.0
+        return (i / (self.config.n_stick_bins - 1)) * 2.0 - 1.0
+
+    # ------------------------------------------------------------------
+    # Conversion
+    # ------------------------------------------------------------------
+
+    def make_empty_action(self, T: int) -> torch.Tensor:
+        """Create a zero-action tensor of shape (T, seq_len)."""
+        # Neutral sticks are bin index 1 (middle of 3 bins), no triggers.
+        neutral = [0] * self.n_buttons + [1, 1, 1, 1]
+        t = torch.tensor([neutral], dtype=torch.long).expand(T, -1).clone()
+        return t
+
+    def action_to_tensor(self, gamepad_actions) -> torch.Tensor:
+        """Convert a GamePadAction proto to a (1, seq_len) integer tensor."""
+        parsed = parse_gamepad_actions(gamepad_actions)
+
+        if parsed is None:
+            return self.make_empty_action(T=1)
+
+        pressed_proto = set(parsed["pressed_buttons"])
+        left_stick_x, left_stick_y, left_pressed = parsed["left_stick"]
+        right_stick_x, right_stick_y, right_pressed = parsed["right_stick"]
+
+        # Build pressed set in our vocabulary
+        pressed_logical = set(pressed_proto) & set(CUPHEAD_BUTTON_VOCAB)
+        if left_pressed and "left_thumb" in CUPHEAD_BUTTON_VOCAB:
+            pressed_logical.add("left_thumb")
+        if right_pressed and "right_thumb" in CUPHEAD_BUTTON_VOCAB:
+            pressed_logical.add("right_thumb")
+
+        # Binary button vector
+        btn_tokens = [
+            1 if name in pressed_logical else 0
+            for name in CUPHEAD_BUTTON_VOCAB
+        ]
+
+        tokens = btn_tokens + [
+            self._quantize_stick(left_stick_x),
+            self._quantize_stick(left_stick_y),
+            self._quantize_stick(right_stick_x),
+            self._quantize_stick(right_stick_y),
+        ]
+        assert len(tokens) == self.get_seq_len()
+        return torch.tensor([tokens], dtype=torch.long)
+
+    def tensor_to_action(
+        self,
+        action: torch.Tensor,
+        mouse_sampling_approach: str = "mean",
+    ) -> DecodedGamepadAction:
+        """Decode a (1, seq_len) tensor back to semantic gamepad actions."""
+        _ = mouse_sampling_approach
+        assert action.shape == (1, self.get_seq_len()), action.shape
+        tokens = action[0].tolist()
+
+        btn_tokens = tokens[: self.n_buttons]
+        axis_tokens = tokens[self.n_buttons :]
+
+        buttons_down = [
+            CUPHEAD_BUTTON_VOCAB[i]
+            for i, v in enumerate(btn_tokens)
+            if v == 1
+        ]
+
+        lx_idx, ly_idx, rx_idx, ry_idx = axis_tokens
+        left_stick = (self._dequantize_stick(lx_idx), self._dequantize_stick(ly_idx))
+        right_stick = (self._dequantize_stick(rx_idx), self._dequantize_stick(ry_idx))
+
+        return DecodedGamepadAction(
+            buttons_down=buttons_down,
+            left_stick=left_stick,
+            right_stick=right_stick,
+            left_trigger=0.0,
+            right_trigger=0.0,
+        )
+
+    def serialize(self) -> str:
+        data = {
+            "type": "gamepad_direct",
+            "n_stick_bins": self.config.n_stick_bins,
+            "stick_deadzone": self.config.stick_deadzone,
+            "button_vocab": deepcopy(CUPHEAD_BUTTON_VOCAB),
         }
         return json.dumps(data)

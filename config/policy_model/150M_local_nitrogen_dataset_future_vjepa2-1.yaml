@@ -1,14 +1,14 @@
 shared:
-  output_path: output/policy_model/150M_nitrogen_future_gt_vjepa2_1
+  output_path: output/policy_model/150M_nitrogen_cuphead_all_future_gt_vjepa2
   n_seq_timesteps: 200
   frame_height: 192
   frame_width: 192
   action_mapping_type: "gamepad"
   gamepad_action_mapping:
     max_buttons: 6
-    n_stick_bins: 33
+    n_stick_bins: 3
     n_trigger_bins: 17
-    stick_deadzone: 0.05
+    stick_deadzone: 0.15
   text_tokenizer_config:
     text_tokenizer_name: "gemma"
     text_embedding_shape: [1, 768]
@@ -36,7 +36,7 @@ policy_model:
 
 stage3_finetune:
   init:
-    auto_resume_latest_checkpoint: false
+    auto_resume_latest_checkpoint: True
   future_vision_target_mode: "future"
   # 输入侧仍使用 shared.tokenizer (conv)；
   # 仅 state 监督目标使用 vjepa2.1 tokenizer。

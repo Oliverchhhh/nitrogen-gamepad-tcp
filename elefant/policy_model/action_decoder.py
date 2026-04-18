@@ -146,6 +146,7 @@ class ActionDecoder(Transformer):
     def forward(
         self, input_action_token: torch.Tensor, action_embeddings_in: torch.Tensor
     ):
+        # input_action_token: [B, T, E]  where T may be n_steps * n_future_action_tokens
         B, T, E = input_action_token.shape
         eager_assert(E, self.cfg.input_action_token_dim)
 
@@ -175,7 +176,7 @@ class ActionDecoder(Transformer):
             inp_tokens_with_pos.shape, (B, T, self.n_action_tokens, self.cfg.embed_dim)
         )
 
-        # Combine B, T dimensions, the "time" dimension in this transformer is the "action" dimension.
+        # Combine B, T dimensions; the "time" dimension here is the "action" dimension.
         inp_tokens_with_pos = inp_tokens_with_pos.view(
             B * T, self.n_action_tokens, self.cfg.embed_dim
         )
@@ -184,10 +185,8 @@ class ActionDecoder(Transformer):
         eager_assert(y.shape, (B * T, self.n_action_tokens, self.cfg.embed_dim))
 
         y = y.view(B, T, self.n_action_tokens, self.cfg.embed_dim)
-        eager_assert(y.shape, (B, T, self.n_action_tokens, self.cfg.embed_dim))
 
-        # The final token is for inputing the last action.
-        # Right now its not used, in future if we allow the model to see past actions it will be.
+        # The final token is for inputting the last action (unused for now).
         y = y[:, :, 0:-1, :]
         eager_assert(y.shape, (B, T, self.n_action_tokens - 1, self.cfg.embed_dim))
 
