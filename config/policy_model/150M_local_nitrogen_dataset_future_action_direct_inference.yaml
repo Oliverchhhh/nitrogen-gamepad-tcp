@@ -7,6 +7,10 @@ shared:
   gamepad_direct_action_mapping:
     n_stick_bins: 3
     stick_deadzone: 0.15
+  text_tokenizer_config:
+    text_tokenizer_name: "gemma"
+    text_embedding_shape: [1, 768]
+    text_annotation_model_version: ["gemini-2.5-flash", "gemini-2.5-flash-thinking-0905"]
   tokenizer:
     type: "conv"
     conv_tokenizer_config:
@@ -38,12 +42,6 @@ stage3_finetune:
     beta_2: 0.999
 
   future_vision_target_mode: "future"
-  # 推理时不需要实际加载 state_target_tokenizer，但需要设置为非 null
-  # 以便 inference.py 正确识别此 checkpoint 为 Stage3FutureVisionLightning 类型
-  state_target_tokenizer:
-    type: "conv"
-    conv_tokenizer_config:
-      num_tokens: 1
 
   validation_step_interval: 999999
   n_validation_steps: 0

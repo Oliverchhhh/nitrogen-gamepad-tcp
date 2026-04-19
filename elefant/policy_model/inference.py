@@ -596,6 +596,12 @@ class InferenceServer(UnixDomainSocketInferenceServer):
                     "Full inference mode currently only supports keyboard_mouse mapping."
                 )
             logging.info("Using gamepad action mapping for inference.")
+        elif mapping_type == "gamepad_direct":
+            from elefant.data.action_mapping import GamepadDirectActionMapping
+            self.action_mapping = GamepadDirectActionMapping(
+                config=self.config.shared.gamepad_direct_action_mapping
+            )
+            logging.info("Using gamepad_direct action mapping for inference.")
         else:
             self.action_mapping = UniversalAutoregressiveActionMapping(
                 config=config.shared.action_mapping
@@ -1235,7 +1241,7 @@ class InferenceServer(UnixDomainSocketInferenceServer):
         reader = asyncio.StreamReader()
         protocol = asyncio.StreamReaderProtocol(reader)
         try:
-        await loop.connect_read_pipe(lambda: protocol, sys.stdin)
+            await loop.connect_read_pipe(lambda: protocol, sys.stdin)
         except Exception as e:
             logging.warning(f"Could not connect stdin pipe (likely running in Docker): {e}")
             return
