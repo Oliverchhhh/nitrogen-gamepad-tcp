@@ -41,14 +41,6 @@ stage3_finetune:
     beta_1: 0.9
     beta_2: 0.999
 
-  future_vision_target_mode: "future"
-  # 推理时不需要实际加载 state_target_tokenizer，但需要设置为非 null
-  # 以便 inference.py 正确识别此 checkpoint 为 Stage3FutureVisionLightning 类型
-  state_target_tokenizer:
-    type: "conv"
-    conv_tokenizer_config:
-      num_tokens: 1
-
   validation_step_interval: 20000
   n_validation_steps: &n_validation_steps 200
   save_every_n_steps: 10000

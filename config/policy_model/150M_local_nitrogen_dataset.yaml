@@ -21,6 +21,7 @@ shared:
 inference:
   mouse_sampling_approach: "truncated_normal"
 
+# Policy Model Configuration (Stage 2 student & 3 model)
 policy_model:
   n_transformer_layers: 10
   n_q_head: 16
@@ -28,11 +29,12 @@ policy_model:
   n_thinking_tokens: 1
   transformer_dim: &transformer_dim 1024
   mask_block_size: 128
-  attention_history_len: [200, 200, 200, 200, 200, 200, 200, 200, 200, 200]
+  attention_history_len: [200, 200, 200, 200, 200, 200, 200, 200, 200, 200] # the length of the attention history needs to be the same as n_transformer_layers
   n_kv_sink_tokens: 0
   model_type: "dense"
   action_decoder:
     embed_dim: *transformer_dim
+
 
 stage3_finetune:
   optim:
@@ -81,6 +83,7 @@ stage3_finetune:
       dataset_worker_prefetch_factor: &validation_stage3_dataset_worker_prefetch_factor 8
       warn_on_starvation: false
       always_labelled: true
+
 
 wandb:
   enabled: True
