@@ -34,6 +34,10 @@ class PolicyCausalTransformerConfig(TransformerConfig):
     # Set True for gamepad_direct mode: ActionDecoder is not used, skip init to
     # avoid DDP "unused parameters" errors.
     skip_action_decoder: bool = False
+    # Set True to zero out real-action inputs to the transformer (both training and inference).
+    # This eliminates the train/inference distribution mismatch caused by teacher-forced
+    # real actions being unavailable at inference time.
+    zero_action_input: bool = False
 
 
 class MoEPolicyCausalTransformerConfig(PolicyCausalTransformerConfig):
@@ -694,6 +698,12 @@ class PolicyCausalTransformer(torch.nn.Module):
             lambda x: x.unsqueeze(0), sampled_action
         )
 
+        if self.config.zero_action_input:
+            # No Pass 2: KV cache already written with dummy zeros in Pass 1.
+            # This matches training behaviour where real actions are never fed in.
+            next_idx = input_pos[-1] + 1
+            return sampled_action, next_idx, kv_cache_state
+
         # ── Pass 2: fill in real action embeddings, update KV cache ──
         action_embeddings_in = action_in_to_tokens_fn(sampled_action_reshaped)
         action_embeddings_in = action_embeddings_in.view(
@@ -777,6 +787,8 @@ class PolicyCausalTransformer(torch.nn.Module):
 
         action_tokens_with_pos = (
             action_embeddings_in + self.action_pos_tokens.unsqueeze(0)
+            if not self.config.zero_action_input
+            else self.action_pos_tokens.unsqueeze(0).expand(B, T, -1, -1)
         )
         text_tokens_embed = self.text_embed_mlp(text_tokens_embed)
         text_tokens_embed = text_tokens_embed.reshape(
@@ -908,7 +920,14 @@ class PolicyCausalTransformer(torch.nn.Module):
         # Build shifted action embeddings per offset
         shifted_parts = []
         for offset in future_offsets:
-            if offset == 0:
+            if self.config.zero_action_input:
+                # Zero out teacher-forcing inputs to match inference behaviour
+                shifted_parts.append(
+                    torch.zeros(B, T, n_act, D,
+                                device=action_embeddings_in.device,
+                                dtype=action_embeddings_in.dtype)
+                )
+            elif offset == 0:
                 shifted_parts.append(action_embeddings_in)  # [B, T, n_act, D]
             else:
                 # shift left by offset, pad with zeros on the right
@@ -1243,6 +1262,17 @@ class PolicyFutureCausalTransformer(PolicyCausalTransformer):
         sampled_action_reshaped = pytree.tree_map(
             lambda x: x.unsqueeze(0), sampled_action
         )
+
+        if self.config.zero_action_input:
+            # No Pass 2: KV cache already written with dummy zeros in Pass 1.
+            next_idx = input_pos[-1] + 1
+            # future_vision_pred not available without Pass 2; return zeros as placeholder
+            future_vision_pred = torch.zeros(
+                B, 1, self.config.embed_dim,
+                device=img.device, dtype=img.dtype,
+            )
+            return sampled_action, next_idx, kv_cache_state, future_vision_pred
+
         action_embeddings_in = action_in_to_tokens_fn(sampled_action_reshaped)
         action_embeddings_in = action_embeddings_in.view(
             B, self.config.n_action_tokens, self.config.embed_dim

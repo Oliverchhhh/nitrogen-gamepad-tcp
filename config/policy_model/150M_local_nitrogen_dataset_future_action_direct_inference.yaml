@@ -26,6 +26,7 @@ policy_model:
   n_kv_sink_tokens: 0
   model_type: "dense"
   n_future_action_tokens: 18
+  zero_action_input: true
   action_decoder:
     embed_dim: *transformer_dim
 

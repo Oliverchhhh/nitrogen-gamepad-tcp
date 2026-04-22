@@ -9,12 +9,12 @@
 set -e
 
 CONFIG_FILE="config/policy_model/150M_local_nitrogen_dataset_future_action_direct.yaml"
-DATA_FOLDER="cuphead_one_level_1"
-OUTPUT_DIR="output/policy_model/150M_nitrogen_cuphead_future_action_direct_F18_2head_zero_action_onelevel_1"
+DATA_FOLDER="cuphead_one_level_2"
+OUTPUT_DIR="output/policy_model/150M_nitrogen_cuphead_future_action_direct_F18_2head_zero_action_onelevel_2"
 RESUME_CKPT=""   # 指定起始 checkpoint 路径（覆盖 auto_resume）
 TEMP_CONFIG_FILE=""
-GPUS="1"   # 留空则使用所有可见 GPU（多卡），设为单个数字则单卡
-WANDB_EXP_NAME="150M-nitrogen-cuphead-future-action-direct-F18-2head-zero-action-onelevel-1"  # 覆盖 yaml 中的 wandb.exp_name（留空则使用 yaml 默认值）
+GPUS="2"   # 留空则使用所有可见 GPU（多卡），设为单个数字则单卡
+WANDB_EXP_NAME="150M-nitrogen-cuphead-future-action-direct-F18-2head-zero-action-onelevel-2"  # 覆盖 yaml 中的 wandb.exp_name（留空则使用 yaml 默认值）
 
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
