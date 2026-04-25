@@ -12,7 +12,7 @@ DATA_FOLDER="NitroGen_cuphead_toy"
 CHECKPOINT_PATH="/data2T/rjt/nitrogen-openp2p2-future-frame/output/policy_model/150M_nitrogen_cuphead_future_action_direct_F18_2head_zero_action_all/stage3_finetune/checkpoint-step=00130000.ckpt"
 MIN_STEPS=""
 MAX_STEPS=""
-N_VALIDATION_STEPS="72"
+N_VALIDATION_STEPS="18"
 GPU_ID="0"
 NO_WANDB=true
 

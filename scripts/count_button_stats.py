@@ -42,7 +42,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dataset_root",
         type=Path,
-        default=Path("cuphead_dataset_converted"),
+        default=Path("cuphead_dataset_converted/v350335326"),
     )
     parser.add_argument(
         "--stick_deadzone",
@@ -53,7 +53,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output_json",
         type=Path,
-        default=Path("dataset_jsons/cuphead_button_stats.json"),
+        default=Path("dataset_jsons/cuphead_button_v350335326_stats.json"),
     )
     parser.add_argument(
         "--workers",

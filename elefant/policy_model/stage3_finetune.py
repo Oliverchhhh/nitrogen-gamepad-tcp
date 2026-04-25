@@ -83,11 +83,15 @@ class GamepadDirectActionLogits(NamedTuple):
     """
     Logits for the direct (non-autoregressive) gamepad head.
 
-    buttons:      [B, T, n_buttons]       binary per-button logits (BCEWithLogits)
-    left_stick_x: [B, T, n_stick_bins]    classification logits
-    left_stick_y: [B, T, n_stick_bins]
-    right_stick_x:[B, T, n_stick_bins]
-    right_stick_y:[B, T, n_stick_bins]
+    Single-token multi-frame mode (n_future_action_tokens=1):
+      buttons:      [B, T, F, n_buttons]    binary per-button logits (BCEWithLogits)
+      left_stick_x: [B, T, F, n_stick_bins] classification logits
+      left_stick_y: [B, T, F, n_stick_bins]
+      right_stick_x:[B, T, F, n_stick_bins]
+      right_stick_y:[B, T, F, n_stick_bins]
+
+    where F = n_future_frames (number of future frames decoded from the single a_in token).
+    At inference time only frame index 0 is used (current frame).
 
     Triggers excluded: Cuphead never uses trigger inputs
     (lt=0.037%, rt=0.084% across 5.6M frames — noise only).
@@ -409,6 +413,12 @@ class PolicyModelTrainer(ModelFreePolicy):
         if self._use_gamepad_direct_mapping():
             self.n_direct_buttons = self.action_mapping.get_n_buttons()
             self.n_direct_stick_bins = self.action_mapping.get_n_stick_bins()
+            # Number of future frames decoded from the single a_in token.
+            # n_future_action_tokens is always 1 in this mode; n_future_frames
+            # controls how many frames the MLP head decodes at once.
+            self.n_direct_future_frames = getattr(
+                self.config.policy_model, "n_future_frames", 1
+            )
 
             # MLP: D -> D/2 -> D/4
             hidden = embed_dim // 2
@@ -420,9 +430,14 @@ class PolicyModelTrainer(ModelFreePolicy):
             )
             mlp_out = hidden // 2
 
-            # 2 independent heads (no trigger head — Cuphead never uses triggers)
-            self.direct_button_head = nn.Linear(mlp_out, self.n_direct_buttons)
-            self.direct_stick_head = nn.Linear(mlp_out, 4 * self.n_direct_stick_bins)
+            # 2 independent heads — each outputs F frames at once
+            # (no trigger head — Cuphead never uses triggers)
+            self.direct_button_head = nn.Linear(
+                mlp_out, self.n_direct_future_frames * self.n_direct_buttons
+            )
+            self.direct_stick_head = nn.Linear(
+                mlp_out, self.n_direct_future_frames * 4 * self.n_direct_stick_bins
+            )
 
             # Linear projection: action integer vector [seq_len] -> single embedding [D]
             # Used for real action tokens in transformer (KV cache state refresh)
@@ -536,38 +551,41 @@ class PolicyModelTrainer(ModelFreePolicy):
             )
 
         def _direct_head_fn(action_token_out):
-            """Direct mode: a_in^0 [B,1,D] → MLP → 2 heads → sampled action [1, seq_len]."""
-            logits = self.action_out_tokens_to_logits(action_token_out)  # [B, 1, ...]
-            btn_pred = (logits.buttons[0, 0].sigmoid() > 0.5).long()  # [n_buttons]
-            lx = logits.left_stick_x[0, 0].argmax(-1, keepdim=True)
-            ly = logits.left_stick_y[0, 0].argmax(-1, keepdim=True)
-            rx = logits.right_stick_x[0, 0].argmax(-1, keepdim=True)
-            ry = logits.right_stick_y[0, 0].argmax(-1, keepdim=True)
+            """Direct mode: a_in^0 [B,1,D] → MLP → 2 heads → sampled action [1, seq_len].
+            The head decodes n_direct_future_frames frames; at inference we only use f=0.
+            """
+            logits = self.action_out_tokens_to_logits(action_token_out)  # [B, 1, F, ...]
+            # Take frame index 0 for current-frame action
+            btn_pred = (logits.buttons[0, 0, 0].sigmoid() > 0.5).long()  # [n_buttons]
+            lx = logits.left_stick_x[0, 0, 0].argmax(-1, keepdim=True)
+            ly = logits.left_stick_y[0, 0, 0].argmax(-1, keepdim=True)
+            rx = logits.right_stick_x[0, 0, 0].argmax(-1, keepdim=True)
+            ry = logits.right_stick_y[0, 0, 0].argmax(-1, keepdim=True)
             return torch.cat([btn_pred, lx, ly, rx, ry], dim=-1).unsqueeze(0)  # [1, seq_len=16]
 
         @(torch.compile(fullgraph=True) if compile else lambda f: f)
         def _predict(frame, idx, kv_cache_state, unif_rand, text_tokens_embed):
             frame = self._normalize_frames(frame)
-            frame = torch.unsqueeze(frame, 0).unsqueeze(0)
+            frame = torch.unsqueeze(frame, 0).unsqueeze(0) # [B, T, C, H, W], [1, 1, 3, 192, 192]
 
             cache_is_full = False
             if (
                 kv_cache_state[0].k_cache.shape[2]
                 >= self.bc_transformer.kv_cache.max_seq_len
             ):
-                cache_is_full = True
+                cache_is_full = True #缓存满了
 
             sampled_action, idx, kv_cache_state, *_ = self.bc_transformer.online_forward(
                 frame,
-                text_tokens_embed=text_tokens_embed,
-                idx=idx,
+                text_tokens_embed=text_tokens_embed, # [1, 200, 1, 768], 全0
+                idx=idx, 
                 kv_cache_state=kv_cache_state,
-                should_grow_cache=not cache_is_full,
-                action_sampler=_action_sampler,
-                empty_sampled_action_fn=self.action_mapping.make_empty_action,
+                should_grow_cache=not cache_is_full, #如果缓存不满，则不增长
+                action_sampler=_action_sampler, #ar action decoder时采用
+                empty_sampled_action_fn=self.action_mapping.make_empty_action, #在 online_forward 里，第一帧推理时没有历史 action，就用这个全零 tensor 作为 action 输入槽的初始值。
                 reshape_structured_action_fn=None,
-                action_in_to_tokens_fn=self.action_in_to_tokens,
-                direct_action_head_fn=_direct_head_fn if self._use_gamepad_direct_mapping() else None,
+                action_in_to_tokens_fn=self.action_in_to_tokens,  #real action to tokens时采用, zero action input下real action tokens全0
+                direct_action_head_fn=_direct_head_fn if self._use_gamepad_direct_mapping() else None, #direct action head时采用
             )
 
             return sampled_action, idx, kv_cache_state
@@ -830,18 +848,27 @@ class PolicyModelTrainer(ModelFreePolicy):
         # Any changes here should be reflected in the online_kv_cache_predict function.
 
         if self._use_gamepad_direct_mapping():
-            # action_out_tokens: [B, T, D] — single a_in^f token per frame
-            feat = self.direct_action_mlp(action_out_tokens)  # [B, T, mlp_out]
-            btn_logits = self.direct_button_head(feat)         # [B, T, n_buttons]
-            stick_logits = self.direct_stick_head(feat)        # [B, T, 4*n_stick_bins]
-
+            # action_out_tokens: [B, T, D] — single a_in token per step.
+            # The MLP decodes it into F frames simultaneously.
+            # Output shapes: buttons [B,T,F,k], each stick axis [B,T,F,S].
+            F_dec = self.n_direct_future_frames
             S = self.n_direct_stick_bins
+            k = self.n_direct_buttons
+
+            feat = self.direct_action_mlp(action_out_tokens)   # [B, T, mlp_out]
+            btn_logits_flat = self.direct_button_head(feat)     # [B, T, F*k]
+            stick_logits_flat = self.direct_stick_head(feat)    # [B, T, F*4*S]
+
+            B_dim, T_dim, _ = action_out_tokens.shape
+            btn_logits   = btn_logits_flat.view(B_dim, T_dim, F_dec, k)
+            stick_logits = stick_logits_flat.view(B_dim, T_dim, F_dec, 4 * S)
+
             return GamepadDirectActionLogits(
                 buttons=btn_logits,
-                left_stick_x=stick_logits[:, :, 0*S:1*S],
-                left_stick_y=stick_logits[:, :, 1*S:2*S],
-                right_stick_x=stick_logits[:, :, 2*S:3*S],
-                right_stick_y=stick_logits[:, :, 3*S:4*S],
+                left_stick_x=stick_logits[..., :S],
+                left_stick_y=stick_logits[..., S:2*S],
+                right_stick_x=stick_logits[..., 2*S:3*S],
+                right_stick_y=stick_logits[..., 3*S:],
             )
 
         B, T, N, D = action_out_tokens.shape
@@ -1346,21 +1373,22 @@ class PolicyModelTrainer(ModelFreePolicy):
         )
 
         F = self.config.policy_model.n_future_action_tokens
+        # For gamepad_direct single-token mode, the number of decoded future frames
+        # comes from n_future_frames (head output), not n_future_action_tokens (=1).
+        F_dec = getattr(self.config.policy_model, "n_future_frames", F) if self._use_gamepad_direct_mapping() else F
 
         # Sample random future offsets for this training step
-        if F == 1:
+        if F_dec == 1:
             future_offsets = [0]
         else:
             # offset[0] always 0 (current frame)
-            # remaining F-1 offsets randomly sampled from [1, chunk_size],
+            # remaining F_dec-1 offsets randomly sampled from [1, chunk_size],
             # uniformly partitioned to ensure coverage across the full chunk.
-            # When F-1 >= chunk_size, partition=1 and offsets become consecutive [0..F-1].
+            # When F_dec-1 >= chunk_size, partition=1 and offsets become consecutive [0..F_dec-1].
             chunk_size = 18
-            n_future = F - 1
+            n_future = F_dec - 1
             if n_future >= chunk_size:
-                # F covers entire chunk: use consecutive offsets 1..chunk_size
-                # any extra beyond chunk_size also consecutive (edge case)
-                future_offsets = list(range(F))
+                future_offsets = list(range(F_dec))
             else:
                 partition = chunk_size // n_future
                 future_offsets = [0]
@@ -1373,20 +1401,31 @@ class PolicyModelTrainer(ModelFreePolicy):
         action_out_embeddings, _, auxiliary_losses, auxiliary_outputs = (
             self.transformer_forward_function(
                 frames, action_embeddings_in, text_tokens_embed,
-                future_offsets=future_offsets,
+                # gamepad_direct: n_future_action_tokens=1, transformer only needs offset [0]
+                future_offsets=[0] if self._use_gamepad_direct_mapping() else future_offsets,
                 skip_action_decoder=self._use_gamepad_direct_mapping(),
             )
         )
 
         if self._use_gamepad_direct_mapping():
-            # action_out_embeddings: [B, T, F, D] — raw a_in^f transformer outputs
+            # Single-token multi-frame decode:
+            # action_out_embeddings: [B, T, 1, D] (n_future_action_tokens=1)
+            # a_in^0 token → head → [B, T, F_dec, ...] logits for all future frames.
+            a_in_0 = action_out_embeddings[:, :, 0, :]  # [B, T, D]
+            action_logits_all = self.action_out_tokens_to_logits(a_in_0)  # [B, T, F_dec, ...]
             total_loss = None
             total_ce_loss = None
             total_losses = {}
             for i, offset in enumerate(future_offsets):
                 labels_i = self._build_future_masked_labels(masked_labels, offset)
-                a_in_f = action_out_embeddings[:, :, i, :]  # [B, T, D]
-                action_logits_i = self.action_out_tokens_to_logits(a_in_f)
+                # Slice frame i: each field [B, T, F_dec, ...] -> [B, T, ...]
+                action_logits_i = GamepadDirectActionLogits(
+                    buttons=action_logits_all.buttons[:, :, i, :],
+                    left_stick_x=action_logits_all.left_stick_x[:, :, i, :],
+                    left_stick_y=action_logits_all.left_stick_y[:, :, i, :],
+                    right_stick_x=action_logits_all.right_stick_x[:, :, i, :],
+                    right_stick_y=action_logits_all.right_stick_y[:, :, i, :],
+                )
                 aux = auxiliary_losses if i == 0 else {}
                 loss_i, ce_i, losses_i = self._calculate_action_losses_from_logits_eager(
                     action_logits=action_logits_i,
@@ -1404,9 +1443,9 @@ class PolicyModelTrainer(ModelFreePolicy):
                     total_ce_loss = total_ce_loss + ce_i
                     for k, v in losses_i.items():
                         total_losses[k] = total_losses.get(k, 0) + v
-            total_loss = total_loss / F
-            total_ce_loss = total_ce_loss / F
-            total_losses = {k: v / F for k, v in total_losses.items()}
+            total_loss = total_loss / F_dec
+            total_ce_loss = total_ce_loss / F_dec
+            total_losses = {k: v / F_dec for k, v in total_losses.items()}
             return total_loss, total_ce_loss, total_losses, auxiliary_outputs
 
         if F == 1:
@@ -2233,12 +2272,44 @@ class Stage3FutureVisionLightning(PolicyModelTrainer):
         # Keep complex action CE/z-loss in eager mode to avoid over-fusion/compile failures.
         if self._use_gamepad_direct_mapping():
             # action_out_embeddings: [B, T, 1, D] -> [B, T, D]
-            action_logits = self.action_out_tokens_to_logits(action_out_embeddings[:, :, 0, :])
+            # action_out_tokens_to_logits returns [B, T, F_dec, ...] for direct mode
+            a_in_0 = action_out_embeddings[:, :, 0, :]
+            action_logits_all = self.action_out_tokens_to_logits(a_in_0)  # [B, T, F_dec, ...]
+            F_dec = self.n_direct_future_frames
+            future_offsets_val = list(range(F_dec))
+            total_action_loss = None
+            total_losses = {}
+            for i, offset in enumerate(future_offsets_val):
+                labels_i = self._build_future_masked_labels(masked_labels, offset)
+                action_logits_i = GamepadDirectActionLogits(
+                    buttons=action_logits_all.buttons[:, :, i, :],
+                    left_stick_x=action_logits_all.left_stick_x[:, :, i, :],
+                    left_stick_y=action_logits_all.left_stick_y[:, :, i, :],
+                    right_stick_x=action_logits_all.right_stick_x[:, :, i, :],
+                    right_stick_y=action_logits_all.right_stick_y[:, :, i, :],
+                )
+                aux = auxiliary_losses if i == 0 else {}
+                loss_i, _, losses_i = self._calculate_action_losses_from_logits_eager(
+                    action_logits=action_logits_i,
+                    masked_labels=labels_i,
+                    auxiliary_losses=aux,
+                    batch_size=action_out_embeddings.shape[0],
+                    T=action_out_embeddings.shape[1],
+                )
+                if total_action_loss is None:
+                    total_action_loss = loss_i
+                    total_losses = {k: v for k, v in losses_i.items()}
+                else:
+                    total_action_loss = total_action_loss + loss_i
+                    for k, v in losses_i.items():
+                        total_losses[k] = total_losses.get(k, 0) + v
+            action_loss = total_action_loss / F_dec
+            losses = {k: v / F_dec for k, v in total_losses.items()}
         else:
             action_logits = self.action_out_tokens_to_logits(action_out_embeddings)
-        action_loss, losses = self._calculate_action_loss_from_logits(
-            action_logits, masked_labels, auxiliary_losses
-        )
+            action_loss, losses = self._calculate_action_loss_from_logits(
+                action_logits, masked_labels, auxiliary_losses
+            )
 
         total_loss = action_loss + self.future_vision_loss_weight * future_vision_loss
         auxiliary_outputs["ratio_unlabeled"] = ratio_unlabeled
@@ -2297,12 +2368,42 @@ class Stage3FutureVisionLightning(PolicyModelTrainer):
         )
         future_vision_loss = F.mse_loss(future_vision_pred, future_vision_target)
         if self._use_gamepad_direct_mapping():
-            action_logits = self.action_out_tokens_to_logits(action_out_embeddings[:, :, 0, :])
+            a_in_0 = action_out_embeddings[:, :, 0, :]
+            action_logits_all = self.action_out_tokens_to_logits(a_in_0)  # [B, T, F_dec, ...]
+            F_dec = self.n_direct_future_frames
+            total_action_loss = None
+            total_losses = {}
+            for i in range(F_dec):
+                labels_i = self._build_future_masked_labels(masked_labels, i)
+                action_logits_i = GamepadDirectActionLogits(
+                    buttons=action_logits_all.buttons[:, :, i, :],
+                    left_stick_x=action_logits_all.left_stick_x[:, :, i, :],
+                    left_stick_y=action_logits_all.left_stick_y[:, :, i, :],
+                    right_stick_x=action_logits_all.right_stick_x[:, :, i, :],
+                    right_stick_y=action_logits_all.right_stick_y[:, :, i, :],
+                )
+                aux = auxiliary_losses if i == 0 else {}
+                loss_i, _, losses_i = self._calculate_action_losses_from_logits_eager(
+                    action_logits=action_logits_i,
+                    masked_labels=labels_i,
+                    auxiliary_losses=aux,
+                    batch_size=action_out_embeddings.shape[0],
+                    T=action_out_embeddings.shape[1],
+                )
+                if total_action_loss is None:
+                    total_action_loss = loss_i
+                    total_losses = {k: v for k, v in losses_i.items()}
+                else:
+                    total_action_loss = total_action_loss + loss_i
+                    for k, v in losses_i.items():
+                        total_losses[k] = total_losses.get(k, 0) + v
+            action_loss = total_action_loss / F_dec
+            losses = {k: v / F_dec for k, v in total_losses.items()}
         else:
             action_logits = self.action_out_tokens_to_logits(action_out_embeddings)
-        action_loss, losses = self._calculate_action_loss_from_logits(
-            action_logits, masked_labels, auxiliary_losses
-        )
+            action_loss, losses = self._calculate_action_loss_from_logits(
+                action_logits, masked_labels, auxiliary_losses
+            )
         loss = action_loss + self.future_vision_loss_weight * future_vision_loss
         losses["future_vision"] = future_vision_loss
         val_set_name = list(self.trainer.val_dataloaders.keys())[dataloader_idx]

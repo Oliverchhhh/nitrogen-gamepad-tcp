@@ -508,7 +508,7 @@ def main():
     parser.add_argument("--no_wandb", action="store_true",
                         help="禁用 wandb 上报，仅保存本地 JSON")
     args = parser.parse_args()
-
+    print(f"args: {args}")
     if args.min_steps is not None and args.max_steps is not None:
         if args.min_steps > args.max_steps:
             parser.error("--min_steps must be <= --max_steps")

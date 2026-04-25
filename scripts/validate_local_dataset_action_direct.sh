@@ -4,13 +4,28 @@
 
 set -e
 
+LOG_DIR="val_logs"
+mkdir -p "$LOG_DIR"
+TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+LOG_FILE="${LOG_DIR}/validate_action_direct_${TIMESTAMP}.log"
+exec > >(tee -a "$LOG_FILE") 2>&1
+echo "日志文件: $LOG_FILE"
+
 CONFIG_FILE="config/policy_model/150M_local_nitrogen_dataset_future_action_direct.yaml"
+# DATA_FOLDER="cuphead_one_level_3"
 DATA_FOLDER="NitroGen_cuphead_toy"
-CHECKPOINT_PATH="/data2T/rjt/nitrogen-openp2p2-future-frame/output/policy_model/150M_nitrogen_cuphead_future_action_direct_F18_2head_zero_action_all/stage3_finetune/checkpoint-step=00130000.ckpt"
+#CHECKPOINT_PATH="output/policy_model/150M_nitrogen_cuphead_future_action_direct_F18_2head_zero_action_all/stage3_finetune/checkpoint-step=00100000.ckpt"
+# CHECKPOINT_PATH="output_20260420/policy_model/150M_nitrogen_cuphead_future_action_direct_F18_2head_zero_action_all/stage3_finetune/checkpoint-step=00100000.ckpt"
+#CHECKPOINT_PATH="output_20260420/policy_model/150M_nitrogen_cuphead_future_action_direct_F18_2head_zero_action_onelevel_3/stage3_finetune/checkpoint-step=00030000.ckpt"
+# CHECKPOINT_PATH="output/policy_model/150M_nitrogen_cuphead_future_action_direct_F18_2head_zero_action_v350335326/stage3_finetune/checkpoint-step=00080000.ckpt"
+# CHECKPOINT_PATH="output/policy_model/150M_nitrogen_cuphead_future_action_direct_F18_2head_zero_action_onelevel1/stage3_finetune/checkpoint-step=00030000.ckpt"
+#CHECKPOINT_PATH="output/policy_model/150M_nitrogen_cuphead_future_action_direct_F18_2head_zero_action_v350335326/stage3_finetune/checkpoint-step=00150000.ckpt"
+CHECKPOINT_PATH="output/policy_model/150M_nitrogen_cuphead_future_action_direct_F18_2head_zero_action_all/stage3_finetune/checkpoint-step=00260000.ckpt"
 TEMP_CONFIG_FILE=""
 MIN_STEPS=""
 MAX_STEPS=""
-GPU_ID="0"
+N_SEQUENCES="72"
+GPU_ID="3"
 NO_WANDB=true
 
 GREEN='\033[0;32m'
@@ -26,6 +41,7 @@ usage() {
     echo "  -c    配置文件路径 (默认: config/policy_model/150M_local_nitrogen_dataset_future_action_direct.yaml)"
     echo "  -k    checkpoint 路径（单个 .ckpt 文件或包含多个 checkpoint 的目录）"
     echo "  -g    GPU ID (默认: 0)"
+    echo "  -n    限制验证的轨迹序列数量（可选，默认跑完整个验证集）"
     echo "  --no_wandb    禁用 wandb 上报，仅保存本地 JSON"
     echo "  --min_steps   最小 step（可选，仅当 -k 指向目录时有意义）"
     echo "  --max_steps   最大 step（可选，仅当 -k 指向目录时有意义）"
@@ -49,6 +65,7 @@ while [[ $# -gt 0 ]]; do
         -c) CONFIG_FILE="$2"; shift 2 ;;
         -k) CHECKPOINT_PATH="$2"; shift 2 ;;
         -g) GPU_ID="$2"; shift 2 ;;
+        -n) N_SEQUENCES="$2"; shift 2 ;;
         --no_wandb) NO_WANDB=true; shift ;;
         --min_steps) MIN_STEPS="$2"; shift 2 ;;
         --max_steps) MAX_STEPS="$2"; shift 2 ;;
@@ -157,6 +174,7 @@ n_seq_timesteps = cfg.get("shared", {}).get("n_seq_timesteps", 200)
 frames_per_chunk = 1200
 protos = glob.glob(os.path.join(local_prefix, "**/*.proto"), recursive=True)
 n_protos = len(protos)
+# n_sequences 由 Python 层直接截断，n_validation_steps 始终设为整个验证集大小
 n_validation_steps = n_protos * (frames_per_chunk // n_seq_timesteps)
 cfg["stage3_finetune"]["n_validation_steps"] = max(1, n_validation_steps)
 
@@ -192,6 +210,7 @@ echo -e "\n${YELLOW}[5/5] 开始 teacher-forcing 验证...${NC}"
 echo -e "${GREEN}配置: $CONFIG_FILE  数据集: $DATA_FOLDER  checkpoint: $CHECKPOINT_PATH${NC}"
 [ -n "$MIN_STEPS" ] && echo -e "${GREEN}min_steps: $MIN_STEPS${NC}"
 [ -n "$MAX_STEPS" ] && echo -e "${GREEN}max_steps: $MAX_STEPS${NC}"
+[ -n "$N_SEQUENCES" ] && echo -e "${GREEN}n_sequences (限制): $N_SEQUENCES${NC}"
 echo -e "${GREEN}========================================${NC}"
 echo -e "${YELLOW}验证指标:${NC}"
 echo -e "${YELLOW}  - Perplexity (button BCE + stick CE)${NC}"
@@ -206,6 +225,7 @@ CMD=(python3 elefant/policy_model/validation_action_direct.py
 )
 [ -n "$MIN_STEPS" ] && CMD+=(--min_steps "$MIN_STEPS")
 [ -n "$MAX_STEPS" ] && CMD+=(--max_steps "$MAX_STEPS")
+[ -n "$N_SEQUENCES" ] && CMD+=(--n_sequences "$N_SEQUENCES")
 [ "$NO_WANDB" = true ] && CMD+=(--no_wandb)
 
 "${CMD[@]}"

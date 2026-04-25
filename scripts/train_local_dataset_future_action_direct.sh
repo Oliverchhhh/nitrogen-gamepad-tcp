@@ -1,25 +1,30 @@
 #!/bin/bash
 # Direct Action 多帧预测训练脚本（支持单卡/多卡）
-# gamepad_direct 模式：a_in^0..F-1 经 MLP → 2 head 直接解码，跳过 ActionDecoder
-#   - button_head: BCE（12 个按钮，多标签）
-#   - stick_head:  CE（4 轴 × 3 bins）
+# gamepad_direct 单token多帧模式：
+#   - 每帧只有 1 个 a_in token（n_future_action_tokens=1）
+#   - 该 token 经 MLP → 2 head 直接解码成未来 F 帧的 action
+#   - button_head: BCE（12 个按钮，多标签）× F 帧
+#   - stick_head:  CE（4 轴 × 3 bins）× F 帧
 #   - 无扳机 head（Cuphead 数据集扳机使用率 <0.1%，视为噪声）
-# a_in^0 预测当前帧，a_in^1..F-1 随机采样未来 chunk 内的帧
+#   - zero_action_input: 训练和推理均不输入真实动作，消除 teacher-forcing 分布差异
 
 set -e
 
 CONFIG_FILE="config/policy_model/150M_local_nitrogen_dataset_future_action_direct.yaml"
+# DATA_FOLDER="cuphead_dataset_converted/v350335326"
 DATA_FOLDER="cuphead_one_level_1"
-OUTPUT_DIR="output/policy_model/150M_nitrogen_cuphead_future_action_direct_F18_2head_zero_action_onelevel_1"
+OUTPUT_DIR="output/policy_model/150M_nitrogen_cuphead_future_action_direct_F18_2head_zero_action_test"
 RESUME_CKPT=""   # 指定起始 checkpoint 路径（覆盖 auto_resume）
 TEMP_CONFIG_FILE=""
 GPUS="1"   # 留空则使用所有可见 GPU（多卡），设为单个数字则单卡
-WANDB_EXP_NAME="150M-nitrogen-cuphead-future-action-direct-F18-2head-zero-action-onelevel-1"  # 覆盖 yaml 中的 wandb.exp_name（留空则使用 yaml 默认值）
+WANDB_EXP_NAME="150M-nitrogen-cuphead-future-action-direct-F18-2head-zero-action-test"  # 覆盖 yaml 中的 wandb.exp_name（留空则使用 yaml 默认值）
 
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 RED='\033[0;31m'
 NC='\033[0m'
+
+export TORCH_COMPILE_DISABLE=1
 
 usage() {
     echo "用法: bash scripts/train_local_dataset_future_action_direct.sh [-d 数据集路径] [-o 输出目录] [-c 配置文件] [-g GPU列表] [-k checkpoint路径]"
@@ -101,9 +106,11 @@ if [ ! -f "$CONFIG_FILE" ]; then
 fi
 echo -e "${GREEN}✓ 配置文件: $CONFIG_FILE${NC}"
 FUTURE_TOKENS=$(grep "n_future_action_tokens" "$CONFIG_FILE" | awk '{print $2}')
+FUTURE_FRAMES=$(grep "n_future_frames" "$CONFIG_FILE" | awk '{print $2}')
 ACTION_TYPE=$(grep "action_mapping_type" "$CONFIG_FILE" | awk '{print $2}' | tr -d '"')
 echo -e "${GREEN}✓ action_mapping_type:    ${ACTION_TYPE}${NC}"
-echo -e "${GREEN}✓ n_future_action_tokens: ${FUTURE_TOKENS}${NC}"
+echo -e "${GREEN}✓ n_future_action_tokens: ${FUTURE_TOKENS} (transformer 序列中的 a_in token 数)${NC}"
+echo -e "${GREEN}✓ n_future_frames:        ${FUTURE_FRAMES} (MLP head 解码的未来帧数)${NC}"
 
 # 3. 处理输出目录覆盖 / checkpoint 注入
 TRAIN_CONFIG="$CONFIG_FILE"
@@ -179,8 +186,8 @@ echo -e "\n${YELLOW}[4/4] 启动训练 (${GPU_DESC})...${NC}"
 echo -e "${GREEN}========================================${NC}"
 echo -e "${GREEN}配置文件:  $TRAIN_CONFIG${NC}"
 echo -e "${GREEN}数据集:    $DATA_FOLDER${NC}"
-echo -e "${GREEN}动作模式:  ${ACTION_TYPE} (MLP → 2 head: button BCE + stick CE, 无扳机, 无 ActionDecoder)${NC}"
-echo -e "${GREEN}未来帧数:  ${FUTURE_TOKENS} 帧 (a_in^0..a_in^$((FUTURE_TOKENS-1)))${NC}"
+echo -e "${GREEN}动作模式:  ${ACTION_TYPE} (1 a_in token → MLP → ${FUTURE_FRAMES} 帧: button BCE + stick CE，无扳机，无 ActionDecoder)${NC}"
+echo -e "${GREEN}未来帧数:  ${FUTURE_FRAMES} 帧 (1 token 解码 F 帧，n_future_action_tokens=${FUTURE_TOKENS})${NC}"
 echo -e "${GREEN}GPU:       ${GPU_DESC}${NC}"
 if [ -n "$OUTPUT_DIR" ]; then
     echo -e "${GREEN}输出目录:  $OUTPUT_DIR${NC}"

@@ -51,15 +51,15 @@ class RotaryPositionalEmbeddings(nn.Module):
         # Create position indexes `[0, 1, ..., max_seq_len - 1]`
         seq_idx = torch.arange(
             max_seq_len, dtype=self.theta.dtype, device=self.theta.device
-        )
+        ) # seq_idx: [0, 1, ..., max_seq_len - 1], [4400]
 
         # Outer product of theta and position index; output tensor has
         # a shape of [max_seq_len, dim // 2]
-        idx_theta = torch.einsum("i, j -> ij", seq_idx, self.theta).float()
+        idx_theta = torch.einsum("i, j -> ij", seq_idx, self.theta).float() # idx_theta: [max_seq_len, dim // 2], [4400, 32]
 
         # cache includes both the cos and sin components and so the output shape is
         # [max_seq_len, dim // 2, 2]
-        cache = torch.stack([torch.cos(idx_theta), torch.sin(idx_theta)], dim=-1)
+        cache = torch.stack([torch.cos(idx_theta), torch.sin(idx_theta)], dim=-1) # cache: [max_seq_len, dim // 2, 2], [4400, 32, 2]
         self.register_buffer("cache", cache, persistent=False)
 
         # TODO: we can probably just keep the cache as bfloat16

@@ -30,9 +30,12 @@ policy_model:
   attention_history_len: [200, 200, 200, 200, 200, 200, 200, 200, 200, 200]
   n_kv_sink_tokens: 0
   model_type: "dense"
-  # direct 模式：a_in^0 预测当前帧，a_in^1..a_in^{F-1} 随机采样未来 18 帧 chunk
-  # ActionDecoder 被跳过，a_in^f 直接经 MLP → 2 head 解码（button BCE + stick CE，无扳机）
-  n_future_action_tokens: 18
+  # Single action_in token per step in the transformer sequence.
+  # The MLP head decodes this single token into n_future_frames actions at once.
+  n_future_action_tokens: 1
+  # Number of future frames decoded by the MLP head from the single a_in token.
+  # Head output: F * (n_buttons + 4*n_stick_bins) per step.
+  n_future_frames: 18
   # 训练和推理均不输入真实动作，消除 teacher-forcing 与 AR 推理的分布差异
   zero_action_input: true
   action_decoder:
@@ -70,16 +73,19 @@ stage3_finetune:
     shuffled_chunks_queue_size_per_gpu: 4
     dataset_worker_prefetch_factor: 2
 
-  validation_dataset:
-    batch_size: &validation_stage3_batch_size 2
-    local_prefix: "cuphead_dataset_converted"
-    load_video_name: "192x192.mp4"
-    n_preprocess_threads_per_gpu: &validation_stage3_n_preprocess_threads_per_gpu 8
-    preprocessed_chunks_queue_size_per_gpu: &validation_stage3_preprocessed_chunks_queue_size_per_gpu 1
-    shuffled_chunks_queue_size_per_gpu: &validation_stage3_shuffled_chunks_queue_size 1
-    dataset_worker_prefetch_factor: &validation_stage3_dataset_worker_prefetch_factor 8
-    warn_on_starvation: false
-    always_labelled: true
+  # Keep validation config parseable (correct key: validation_datasets),
+  # but current training does not run validation because n_validation_steps=0.
+  validation_datasets:
+    - validation_name: "default_validation"
+      batch_size: &validation_stage3_batch_size 2
+      local_prefix: "cuphead_dataset_converted"
+      load_video_name: "192x192.mp4"
+      n_preprocess_threads_per_gpu: &validation_stage3_n_preprocess_threads_per_gpu 8
+      preprocessed_chunks_queue_size_per_gpu: &validation_stage3_preprocessed_chunks_queue_size_per_gpu 1
+      shuffled_chunks_queue_size_per_gpu: &validation_stage3_shuffled_chunks_queue_size 1
+      dataset_worker_prefetch_factor: &validation_stage3_dataset_worker_prefetch_factor 8
+      warn_on_starvation: false
+      always_labelled: true
 
 
 wandb:

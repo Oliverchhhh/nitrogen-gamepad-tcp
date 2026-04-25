@@ -118,6 +118,8 @@ class ModelFreePolicy(pl.LightningModule):
                     n_kv_sink_tokens=config.policy_model.n_kv_sink_tokens,
                     n_action_tokens=self.transformer_n_action_tokens,
                     n_future_action_tokens=config.policy_model.n_future_action_tokens,
+                    n_future_frames=getattr(config.policy_model, "n_future_frames", 1),
+                    zero_action_input=getattr(config.policy_model, "zero_action_input", False),
                     skip_action_decoder=_is_direct,
                     text_token_size=self.text_token_size,
                     text_tokenizer_embed_dim=self.text_tokenizer_embed_dim,

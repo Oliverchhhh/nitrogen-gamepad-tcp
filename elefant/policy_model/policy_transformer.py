@@ -22,8 +22,15 @@ class PolicyCausalTransformerConfig(TransformerConfig):
     n_thinking_tokens: int = 1
     # This needs to be set to the number of actions in the action mapping + 1
     n_action_tokens: int = 5
-    # Number of future frames to predict actions for (F=1 degrades to original single-frame)
+    # Number of action_in tokens per step in the transformer sequence.
+    # For gamepad_direct "single-token multi-frame" mode this is always 1.
+    # For legacy multi-token mode this equals n_future_frames.
     n_future_action_tokens: int = 1
+    # Number of future frames decoded from each action_in token (gamepad_direct only).
+    # When n_future_action_tokens == 1, the single a_in token is decoded into
+    # n_future_frames actions by the MLP head (1-token → F-frame decoding).
+    # Ignored when n_future_action_tokens > 1 (legacy multi-token path).
+    n_future_frames: int = 1
     mask_block_size: int = 128
     attention_history_len: List[int]
     n_kv_sink_tokens: int = 1
@@ -551,14 +558,14 @@ class PolicyCausalTransformer(torch.nn.Module):
         # For now at least we assume the length and head is the same at every layer so we only need on kv cache
         # (but separate state for each layer).
         self._transformer.kv_cache = RollingStepKVCache(
-            batch_size=batch_size,
-            step_size=self.step_size,
-            max_T=self.config.n_steps,
-            num_kv_heads=self.config.n_kv_head,
-            embed_size_per_head=self.config.embed_dim // self.config.n_kv_head,
-            device=device,
-            dtype=dtype,
-        )
+            batch_size=batch_size, #batch_size: batch size, 1
+            step_size=self.step_size, #step_size: step size, 22
+            max_T=self.config.n_steps, #max_T: max number of steps, 200
+            num_kv_heads=self.config.n_kv_head, #num_kv_heads: number of key/value heads, 16
+            embed_size_per_head=self.config.embed_dim // self.config.n_kv_head, #embed_size_per_head: 64
+            device=device, #device: device, cuda:0
+            dtype=dtype, #dtype: data type, bfloat16
+        ) #kv_cache is a RollingStepKVCache object: [batch_size, max_seq_len, num_kv_heads, embed_size_per_head], [1, 4400, 8, 16]
         # Tell all the self attention layers about the kv cache object
         # Note this object does not contain kv state, just config for manipulating the cache.
         for i, layer in enumerate(self._transformer.transformer_layers):
@@ -566,13 +573,13 @@ class PolicyCausalTransformer(torch.nn.Module):
                 continue
 
             sa = layer.self_attention
-            sa.kv_cache = self._transformer.kv_cache
-            sa._mask_fn = self._transformer._layer_mask_fns[i]
+            sa.kv_cache = self._transformer.kv_cache #所有层共享同一个 RollingStepKVCache 对象，但每层各自持有一个独立的 KVCacheState
+            sa._mask_fn = self._transformer._layer_mask_fns[i] 
             # Precompute decode masks only if we have a block mask and a concrete mask fn
             if sa.block_mask is not None and sa._mask_fn is not None:
                 sa.precompute_decode_masks(
-                    q_seq_length=self.n_tokens_to_first_action
-                    + self.config.n_action_tokens
+                    q_seq_length=self.n_tokens_to_first_action #21
+                    + self.config.n_action_tokens #1
                 )
 
     def _impute_no_text_embedding(
@@ -622,7 +629,7 @@ class PolicyCausalTransformer(torch.nn.Module):
             + self.config.n_action_tokens
         )
 
-        img_tokens = self.image_tokenizer(img)
+        img_tokens = self.image_tokenizer(img) 
         eager_assert(
             img_tokens.shape,
             (B, T, self.image_tokenizer.get_n_img_tokens(), self.config.embed_dim),
@@ -634,22 +641,23 @@ class PolicyCausalTransformer(torch.nn.Module):
         img_tokens = img_tokens.view(
             B, self.image_tokenizer.get_n_img_tokens(), self.config.embed_dim
         )
-        img_tokens_with_pos = img_tokens + self.img_pos_tokens
+        img_tokens_with_pos = img_tokens + self.img_pos_tokens 
         text_tokens_embed = text_tokens_embed.view(
             B, self.text_token_size, self.text_tokenizer_embed_dim
         ).to(self.device)
         text_tokens_embed = self.text_embed_mlp(text_tokens_embed)
-        text_tokens_embed = self._impute_no_text_embedding(text_tokens_embed)
-        text_tokens_embed_with_pos = text_tokens_embed + self.text_pos_tokens
+        text_tokens_embed = self._impute_no_text_embedding(text_tokens_embed) #全0 text embed 替换成可学习的无文本表示
+        text_tokens_embed_with_pos = text_tokens_embed + self.text_pos_tokens #[1,1,1024]
 
-        input_pos = torch.arange(step_len, device=idx.device, dtype=idx.dtype) + idx
+        input_pos = torch.arange(step_len, device=idx.device, dtype=idx.dtype) + idx #[0,1,2,...,21]+idx
 
-        batch_thinking_pos_tokens = self.thinking_pos_tokens.repeat(B, 1, 1)
+        batch_thinking_pos_tokens = self.thinking_pos_tokens.repeat(B, 1, 1) # [1, 1, 1014]
         batch_action_out_tokens = self.action_out_tokens.repeat(B, 1, 1)  # [B, F, D]
         dummy_action_embeddings_in = torch.zeros(
             B, self.config.n_action_tokens, self.config.embed_dim,
             device=batch_action_out_tokens.device,
         )
+        dummy_action_embeddings_in = dummy_action_embeddings_in+self.action_pos_tokens #dummy action embeddings in should be zero, but we add the action pos tokens to make it non-zero
 
         # ── Pass 1: dummy real-actions, get a_in^0 output ──
         x = torch.cat(
@@ -668,7 +676,7 @@ class PolicyCausalTransformer(torch.nn.Module):
             x,
             input_pos=input_pos,
             kv_cache_state=kv_cache_state,
-            should_grow_cache=should_grow_cache,
+            should_grow_cache=should_grow_cache, #缓存未满为ture, 缓存满了为False
             use_decode_mask=True,
         )
         eager_assert(y.shape, (B, step_len, self.config.embed_dim))
@@ -785,6 +793,7 @@ class PolicyCausalTransformer(torch.nn.Module):
         )
         img_tokens_with_pos = img_tokens + self.img_pos_tokens.unsqueeze(0)
 
+        print("zero_action_input:", self.config.zero_action_input)
         action_tokens_with_pos = (
             action_embeddings_in + self.action_pos_tokens.unsqueeze(0)
             if not self.config.zero_action_input

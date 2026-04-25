@@ -67,10 +67,10 @@ class RollingStepKVCache(BaseKVCache):
         if batch_size is not None:
             effective_shape = (batch_size, *self.cache_shape[1:])
             self.cache_shape = effective_shape
-        k_cache = torch.zeros(self.cache_shape, dtype=self.dtype, device=self.device)
-        v_cache = torch.zeros(self.cache_shape, dtype=self.dtype, device=self.device)
-        torch._dynamo.mark_dynamic(k_cache, 2)
-        torch._dynamo.mark_dynamic(v_cache, 2)
+        k_cache = torch.zeros(self.cache_shape, dtype=self.dtype, device=self.device) # [1, 16, 0, 64]
+        v_cache = torch.zeros(self.cache_shape, dtype=self.dtype, device=self.device) # [1, 16, 0, 64]
+        torch._dynamo.mark_dynamic(k_cache, 2) #2维度即序列长度是动态的
+        torch._dynamo.mark_dynamic(v_cache, 2) #2维度即序列长度是动态的
 
         return KVCacheState(k_cache=k_cache, v_cache=v_cache)
 
@@ -107,7 +107,7 @@ class RollingStepKVCache(BaseKVCache):
             k_cache = state.k_cache[:, :, self.step_size :, :]
             v_cache = state.v_cache[:, :, self.step_size :, :]
 
-        k_cache = torch.cat([k_cache, k_val], dim=2)
+        k_cache = torch.cat([k_cache, k_val], dim=2) 
         v_cache = torch.cat([v_cache, v_val], dim=2)
 
         return KVCacheState(k_cache=k_cache, v_cache=v_cache)

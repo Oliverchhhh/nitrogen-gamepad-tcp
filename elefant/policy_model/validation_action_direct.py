@@ -257,10 +257,10 @@ def move_batch_to_device(batch, device: torch.device):
         frames=moved_frames,
         action_annotations=moved_action_annotations,
         env_subenv_encoding=batch.env_subenv_encoding.to(device),
-        user_action_mask=batch.user_action_mask.to(device),
-        system_action_mask=batch.system_action_mask.to(device),
-        valid_frame_mask=batch.valid_frame_mask.to(device),
-        text_embeddings=batch.text_embeddings.to(device),
+        user_action_mask=batch.user_action_mask.to(device), #[B, T] #全0
+        system_action_mask=batch.system_action_mask.to(device), #[B, T] #全0
+        valid_frame_mask=batch.valid_frame_mask.to(device), #[B, T] #全1
+        text_embeddings=batch.text_embeddings.to(device), # [B, T, 1, D_text] #全0
         precomputed_vision_features=precomputed.to(device) if precomputed is not None else None,
     )
 
@@ -289,6 +289,7 @@ def set_validation_dataset_cfg_to_single_thread(cfg, batch_size: int):
     cfg.preprocessed_chunks_queue_size_per_gpu = 1
     cfg.dataset_worker_prefetch_factor = 2
     cfg.batch_size = batch_size
+    cfg.shuffle = False  # 关闭 shuffle，保证序列顺序确定性（TF/AR 对比时必须一致）
     return cfg
 
 
@@ -352,8 +353,15 @@ def _forward_direct(model, batch_to_cuda, actions_in, masked_labels):
                 skip_action_decoder=True,
             )
         )
-        # a_in^0 → current-frame logits
-        action_logits = model.action_out_tokens_to_logits(action_out_embeddings[:, :, 0, :])
+        # a_in^0 → [B, T, F, ...] logits; take frame 0 for current-frame TF eval
+        action_logits_all = model.action_out_tokens_to_logits(action_out_embeddings[:, :, 0, :])
+        action_logits = GamepadDirectActionLogits(
+            buttons=action_logits_all.buttons[:, :, 0, :],
+            left_stick_x=action_logits_all.left_stick_x[:, :, 0, :],
+            left_stick_y=action_logits_all.left_stick_y[:, :, 0, :],
+            right_stick_x=action_logits_all.right_stick_x[:, :, 0, :],
+            right_stick_y=action_logits_all.right_stick_y[:, :, 0, :],
+        )
         action_loss, _, losses = model._calculate_action_losses_from_logits_eager(
             action_logits, masked_labels, auxiliary_losses, B, T
         )
@@ -374,8 +382,15 @@ def _forward_direct(model, batch_to_cuda, actions_in, masked_labels):
                 skip_action_decoder=True,
             )
         )
-        # action_out_embeddings: [B, T, F, D] — take a_in^0
-        action_logits = model.action_out_tokens_to_logits(action_out_embeddings[:, :, 0, :])
+        # a_in^0 → [B, T, F, ...] logits; take frame 0 for current-frame TF eval
+        action_logits_all = model.action_out_tokens_to_logits(action_out_embeddings[:, :, 0, :])
+        action_logits = GamepadDirectActionLogits(
+            buttons=action_logits_all.buttons[:, :, 0, :],
+            left_stick_x=action_logits_all.left_stick_x[:, :, 0, :],
+            left_stick_y=action_logits_all.left_stick_y[:, :, 0, :],
+            right_stick_x=action_logits_all.right_stick_x[:, :, 0, :],
+            right_stick_y=action_logits_all.right_stick_y[:, :, 0, :],
+        )
         loss, _, losses = model._calculate_action_losses_from_logits_eager(
             action_logits, masked_labels, auxiliary_losses, B, T
         )
@@ -412,6 +427,7 @@ def report_validation_metrics(
     global_step: int,
     run_id: str,
     use_wandb: bool = True,
+    n_sequences: Optional[int] = None,
 ):
     BATCH_SIZE_FOR_VAL = 1
     t0 = time.time()
@@ -495,6 +511,7 @@ def report_validation_metrics(
             ppl_m = perplexity_metrics[val_set_name]
             dir_m = direct_metrics[val_set_name]
 
+            seq_count = 0
             for batch_idx, batch in enumerate(val_dataloader):
                 batch_cuda = move_batch_to_device(batch, "cuda")
                 actions_in, masked_labels, _ = model._create_target_and_masked_labels(batch_cuda)
@@ -523,12 +540,19 @@ def report_validation_metrics(
                     ppl_m[key].update(cross_entropy_to_perplexity(v).item())
 
                 if isinstance(action_logits, GamepadDirectActionLogits):
+                    # torch.set_printoptions(threshold=10000, linewidth=200)
+                    # print(f"  [batch {batch_idx}] logits: {action_logits}")
                     dir_m.update(action_logits, masked_labels)
 
                 if batch_idx % 100 == 0:
                     elapsed = time.time() - start_time
                     start_time = time.time()
                     print(f"  batch {batch_idx}: {elapsed:.1f}s")
+
+                seq_count += batch_cuda.frames.shape[0]
+                if n_sequences is not None and seq_count >= n_sequences:
+                    print(f"  reached n_sequences={n_sequences}, stopping.")
+                    break
 
                 if (batch_idx + 1) >= n_validation_steps:
                     break
@@ -615,6 +639,7 @@ def run_validation(
     min_steps: Optional[int],
     max_steps: Optional[int],
     use_wandb: bool = True,
+    n_sequences: Optional[int] = None,
 ):
     run_id = wandb.util.generate_id() if use_wandb else "local"
     ckpts = find_all_checkpoints(checkpoint_dir)
@@ -628,7 +653,7 @@ def run_validation(
             continue
         if not is_step_in_range(global_step, min_steps, max_steps):
             continue
-        report_validation_metrics(checkpoint_path, config_path, global_step, run_id, use_wandb)
+        report_validation_metrics(checkpoint_path, config_path, global_step, run_id, use_wandb, n_sequences=n_sequences)
     logging.info("Validation complete.")
 
 
@@ -644,8 +669,10 @@ def main():
     parser.add_argument("--max_steps", type=int, default=None)
     parser.add_argument("--no_wandb", action="store_true",
                         help="禁用 wandb 上报，仅保存本地 JSON")
+    parser.add_argument("--n_sequences", type=int, default=None,
+                        help="限制验证的轨迹序列数量，与 AR 脚本的 --n_sequences 语义对齐（默认跑完整个验证集）")
     args = parser.parse_args()
-
+    print(f"args: {args}")
     if args.min_steps is not None and args.max_steps is not None:
         if args.min_steps > args.max_steps:
             parser.error("--min_steps must be <= --max_steps")
@@ -656,6 +683,7 @@ def main():
         min_steps=args.min_steps,
         max_steps=args.max_steps,
         use_wandb=not args.no_wandb,
+        n_sequences=args.n_sequences,
     )
 
 

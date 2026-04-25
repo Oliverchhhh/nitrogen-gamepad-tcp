@@ -25,13 +25,14 @@ def get_mask_mod(mask_mod, offset):
 
 def get_decode_mask(
     block_mask: BlockMask,
-    offset,
-    mask_fn,
-    q_seq_length,
-    kv_seq_length,
-    device,
+    offset, #
+    mask_fn, #_img_policy_causal_mask_multi_future
+    q_seq_length, #22
+    kv_seq_length, #
+    device, #cuda:0
 ):
-    """Get the mask for decoding at a specific position"""
+    """[LEGACY — BUG: single-block only, breaks when q tokens span two blocks]
+    Get the mask for decoding at a specific position"""
     # block index for query token to select which block the flex attention should select
     # for query tokens(i.e. select relative query block from block mask)
     block_index = torch.tensor(
@@ -45,6 +46,93 @@ def get_decode_mask(
     # that the indices are not 0, 1, 2 but the starting indices + the offset(absolute position up to kv cache "fullness")
     mask.mask_mod = get_mask_mod(mask_fn, offset)
     # This is done so we get a valid subset of the mask during decoding
+    mask.seq_lengths = (q_seq_length, kv_seq_length) #(22, 4400)
+    return mask
+
+
+def get_decode_mask_legacy(
+    block_mask: BlockMask,
+    offset,
+    mask_fn,
+    q_seq_length,
+    kv_seq_length,
+    device,
+):
+    """Get the mask for decoding at a specific position.
+
+    Fix over get_decode_mask_legacy: when q tokens span two BlockMask blocks
+    (i.e. offset and offset+q_seq_length-1 fall in different blocks), merge
+    the kv_num_blocks / kv_indices of both rows so every query token can
+    attend to all kv-blocks it is entitled to.
+    Exact token-level causal filtering is still enforced by mask_mod.
+    """
+    block_size  = block_mask.BLOCK_SIZE[0]
+    block_start = offset // block_size
+    block_end   = (offset + q_seq_length - 1) // block_size
+
+    idx0 = torch.tensor([block_start], dtype=torch.int32, device=device)
+
+    if block_start == block_end:
+        # All q tokens fall within a single block — same as legacy.
+        mask = block_mask[:, :, idx0]
+    else:
+        # q tokens span two consecutive blocks.
+        # Merge the two rows by taking the union of their valid kv-block indices.
+        # kv_indices[b, h, 0, :kv_num_blocks[b,h,0]] are the valid entries;
+        # values beyond that count are undefined padding — must not be included.
+        # print("block_start != block_end")
+        idx1 = torch.tensor([block_end], dtype=torch.int32, device=device)
+        m0 = block_mask[:, :, idx0]   # BlockMask, kv_num_blocks: [B, H, 1]
+        m1 = block_mask[:, :, idx1]   # BlockMask, kv_num_blocks: [B, H, 1]
+
+        B, H = m0.kv_num_blocks.shape[:2]
+
+        # Collect valid indices from both rows and compute union per (b, h).
+        # kv_indices shape: [B, H, 1, max_kv_blocks]
+        max_kv = m0.kv_indices.shape[-1] + m1.kv_indices.shape[-1]
+        merged_idx = torch.zeros(B, H, 1, max_kv, dtype=m0.kv_indices.dtype, device=device)
+        merged_num = torch.zeros(B, H, 1, dtype=m0.kv_num_blocks.dtype, device=device)
+
+        for b in range(B):
+            for h in range(H):
+                n0 = m0.kv_num_blocks[b, h, 0].item()
+                n1 = m1.kv_num_blocks[b, h, 0].item()
+                valid0 = m0.kv_indices[b, h, 0, :n0]
+                valid1 = m1.kv_indices[b, h, 0, :n1]
+                union = torch.unique(torch.cat([valid0, valid1]), sorted=True)
+                n = union.shape[0]
+                merged_idx[b, h, 0, :n] = union
+                merged_num[b, h, 0] = n
+
+        full_num = None
+        full_idx = None
+        if m0.full_kv_num_blocks is not None and m1.full_kv_num_blocks is not None:
+            max_full = m0.full_kv_indices.shape[-1] + m1.full_kv_indices.shape[-1]
+            full_idx = torch.zeros(B, H, 1, max_full, dtype=m0.full_kv_indices.dtype, device=device)
+            full_num = torch.zeros(B, H, 1, dtype=m0.full_kv_num_blocks.dtype, device=device)
+            for b in range(B):
+                for h in range(H):
+                    n0 = m0.full_kv_num_blocks[b, h, 0].item()
+                    n1 = m1.full_kv_num_blocks[b, h, 0].item()
+                    valid0 = m0.full_kv_indices[b, h, 0, :n0]
+                    valid1 = m1.full_kv_indices[b, h, 0, :n1]
+                    union = torch.unique(torch.cat([valid0, valid1]), sorted=True)
+                    n = union.shape[0]
+                    full_idx[b, h, 0, :n] = union
+                    full_num[b, h, 0] = n
+
+        mask = BlockMask.from_kv_blocks(
+            merged_num,
+            merged_idx,
+            full_num,
+            full_idx,
+            BLOCK_SIZE=block_mask.BLOCK_SIZE,
+            mask_mod=None,
+            seq_lengths=block_mask.seq_lengths,
+            compute_q_blocks=block_mask.q_indices is not None,
+        )
+
+    mask.mask_mod = get_mask_mod(mask_fn, offset)
     mask.seq_lengths = (q_seq_length, kv_seq_length)
     return mask
 
@@ -184,8 +272,8 @@ class SelfAttention(nn.Module):
 
         if self.block_mask is None or self._mask_fn is None or self.kv_cache is None:
             return
-        self.stable_start = self.kv_cache.max_seq_len - self.kv_cache.step_size
-        kv_seq_length = self.kv_cache.max_seq_len + self.n_kv_sink_tokens
+        self.stable_start = self.kv_cache.max_seq_len - self.kv_cache.step_size #4400 - 22 = 4378
+        kv_seq_length = self.kv_cache.max_seq_len + self.n_kv_sink_tokens #4400 + 0 = 4400
 
         self._cached_decode_mask = get_decode_mask(
             block_mask=self.block_mask,
@@ -238,7 +326,7 @@ class SelfAttention(nn.Module):
             k = kv_cache_state.k_cache
             v = kv_cache_state.v_cache
 
-        # Prepend KV sinks if enabled
+        # Prepend KV sinks if enabled， disabled in our case
         if self.n_kv_sink_tokens != 0 and k.shape[-2] != 0:
             sink_k = self.k_sinks
             sink_v = self.v_sinks
@@ -253,7 +341,7 @@ class SelfAttention(nn.Module):
                     "flex_attention with torch.compile is buggy on CPU."
                 )
 
-            eager_assert(self.is_causal, False)
+            eager_assert(self.is_causal, False) #causal mask is disabled in our case，is_causal=False，flex_attention_mask和causal mask互斥
 
             q_len = q.size(2)
             kv_len = k.size(2)
@@ -265,17 +353,17 @@ class SelfAttention(nn.Module):
                     and kv_len == (self.kv_cache.max_seq_len + self.n_kv_sink_tokens)
                     and self._cached_decode_mask is not None
                 ):
-                    flex_attention_mask = self._cached_decode_mask
+                    flex_attention_mask = self._cached_decode_mask #缓存满了才需要
                 else:
                     # q_start_pos is in the KV+S space; convert to Q (no-sinks) by subtracting S
-                    q_start_pos = kv_len - q_len
-                    offset = q_start_pos - self.n_kv_sink_tokens
+                    q_start_pos = kv_len - q_len #kv_len:x+s, q_len:x, s：绝对编码的起始点
+                    offset = q_start_pos - self.n_kv_sink_tokens #offset:s
                     flex_attention_mask = get_decode_mask(
                         block_mask=flex_attention_mask,
                         offset=offset,
-                        mask_fn=self._mask_fn,
-                        q_seq_length=q_len,
-                        kv_seq_length=kv_len,
+                        mask_fn=self._mask_fn, #_img_policy_causal_mask_multi_ftuture
+                        q_seq_length=q_len, #22
+                        kv_seq_length=kv_len, 
                         device=q.device,
                     )
 
@@ -284,7 +372,7 @@ class SelfAttention(nn.Module):
                 k,
                 v,
                 block_mask=flex_attention_mask,
-                enable_gqa=self.grouped_qa,
+                enable_gqa=self.grouped_qa, #grouped qa is disabled in our case，grouped_qa=False
             )
         else:
             eager_assert(self.is_causal, True)

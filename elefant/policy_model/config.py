@@ -92,6 +92,12 @@ class PolicyModelConfig(TransformerModelConfig):
     top_p: Optional[float] = None
     z_loss_weight: float = 1e-4
     n_future_action_tokens: int = 1
+    # For gamepad_direct single-token mode:
+    # one a_in token decodes this many future frames via MLP heads.
+    n_future_frames: int = 1
+    # If True, never feed real action tokens into the transformer cache
+    # (disables teacher-forcing action input in both train/inference paths).
+    zero_action_input: bool = False
 
 
 class AdamWOptimConfig(ConfigBase):
