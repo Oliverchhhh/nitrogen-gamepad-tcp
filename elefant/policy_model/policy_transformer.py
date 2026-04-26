@@ -672,7 +672,7 @@ class PolicyCausalTransformer(torch.nn.Module):
         )
         eager_assert(x.shape, (B, step_len, self.config.embed_dim))
 
-        y, *_ = self._transformer.forward(
+        y, kv_cache_state, *_ = self._transformer.forward(
             x,
             input_pos=input_pos,
             kv_cache_state=kv_cache_state,
@@ -793,7 +793,7 @@ class PolicyCausalTransformer(torch.nn.Module):
         )
         img_tokens_with_pos = img_tokens + self.img_pos_tokens.unsqueeze(0)
 
-        print("zero_action_input:", self.config.zero_action_input)
+        # print("zero_action_input:", self.config.zero_action_input)
         action_tokens_with_pos = (
             action_embeddings_in + self.action_pos_tokens.unsqueeze(0)
             if not self.config.zero_action_input
@@ -1246,7 +1246,7 @@ class PolicyFutureCausalTransformer(PolicyCausalTransformer):
             ],
             dim=1,
         )
-        y, *_ = self._transformer.forward(
+        y, kv_cache_state, *_ = self._transformer.forward(
             x,
             input_pos=input_pos,
             kv_cache_state=kv_cache_state,

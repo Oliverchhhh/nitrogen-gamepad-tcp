@@ -17,7 +17,7 @@ import shutil
 import torch
 import time
 
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List, Tuple
 from dataclasses import dataclass
 
 import torch.nn.functional as F
@@ -332,12 +332,51 @@ def _load_model(checkpoint_path: str, config: LightningPolicyConfig):
 # Forward pass — direct action paradigm
 # ---------------------------------------------------------------------------
 
-def _forward_direct(model, batch_to_cuda, actions_in, masked_labels):
+def _select_direct_frame_logits(
+    action_logits_all: GamepadDirectActionLogits, frame_idx: int
+) -> GamepadDirectActionLogits:
+    return GamepadDirectActionLogits(
+        buttons=action_logits_all.buttons[:, :, frame_idx, :],
+        left_stick_x=action_logits_all.left_stick_x[:, :, frame_idx, :],
+        left_stick_y=action_logits_all.left_stick_y[:, :, frame_idx, :],
+        right_stick_x=action_logits_all.right_stick_x[:, :, frame_idx, :],
+        right_stick_y=action_logits_all.right_stick_y[:, :, frame_idx, :],
+    )
+
+
+def _average_loss_dict(loss_dicts: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+    if not loss_dicts:
+        return {}
+    out: Dict[str, torch.Tensor] = {}
+    for d in loss_dicts:
+        for k, v in d.items():
+            out[k] = out.get(k, 0) + v
+    n = len(loss_dicts)
+    for k in list(out.keys()):
+        out[k] = out[k] / n
+    return out
+
+
+def _forward_direct(
+    model,
+    batch_to_cuda,
+    actions_in,
+    masked_labels,
+    frame_index: int = 0,
+    all_future_frames: bool = False,
+):
     """
-    Run one forward pass and return (loss, losses_dict, action_logits).
+    Run one forward pass.
 
     Works for both Stage3LabelledBCLightning and Stage3FutureVisionLightning
     when the model uses gamepad_direct_action_mapping.
+
+    Returns:
+        loss: scalar
+        losses: dict
+        action_logits: GamepadDirectActionLogits for single-frame mode, else None
+        frame_pairs: list[(frame_idx, logits, shifted_labels)] for all-frame mode
+        n_future_frames: int
     """
     frames = model._normalize_frames(batch_to_cuda.frames)
     B = frames.shape[0]
@@ -353,18 +392,43 @@ def _forward_direct(model, batch_to_cuda, actions_in, masked_labels):
                 skip_action_decoder=True,
             )
         )
-        # a_in^0 → [B, T, F, ...] logits; take frame 0 for current-frame TF eval
+        # a_in^0 → [B, T, F, ...] logits
         action_logits_all = model.action_out_tokens_to_logits(action_out_embeddings[:, :, 0, :])
-        action_logits = GamepadDirectActionLogits(
-            buttons=action_logits_all.buttons[:, :, 0, :],
-            left_stick_x=action_logits_all.left_stick_x[:, :, 0, :],
-            left_stick_y=action_logits_all.left_stick_y[:, :, 0, :],
-            right_stick_x=action_logits_all.right_stick_x[:, :, 0, :],
-            right_stick_y=action_logits_all.right_stick_y[:, :, 0, :],
-        )
-        action_loss, _, losses = model._calculate_action_losses_from_logits_eager(
-            action_logits, masked_labels, auxiliary_losses, B, T
-        )
+        n_future_frames = action_logits_all.buttons.shape[2]
+
+        if all_future_frames:
+            frame_pairs: List[Tuple[int, GamepadDirectActionLogits, torch.Tensor]] = []
+            action_losses: List[torch.Tensor] = []
+            loss_dicts: List[Dict[str, torch.Tensor]] = []
+            for i in range(n_future_frames):
+                labels_i = model._build_future_masked_labels(masked_labels, i)
+                action_logits_i = _select_direct_frame_logits(action_logits_all, i)
+                aux_i = auxiliary_losses if i == 0 else {}
+                action_loss_i, _, losses_i = model._calculate_action_losses_from_logits_eager(
+                    action_logits_i, labels_i, aux_i, B, T
+                )
+                frame_pairs.append((i, action_logits_i, labels_i))
+                action_losses.append(action_loss_i)
+                loss_dicts.append(losses_i)
+            action_loss = sum(action_losses) / len(action_losses)
+            losses = _average_loss_dict(loss_dicts)
+            action_logits = None
+        else:
+            if frame_index < 0 or frame_index >= n_future_frames:
+                raise ValueError(
+                    f"frame_index={frame_index} out of range [0, {n_future_frames-1}]"
+                )
+            labels_eval = (
+                model._build_future_masked_labels(masked_labels, frame_index)
+                if frame_index > 0
+                else masked_labels
+            )
+            action_logits = _select_direct_frame_logits(action_logits_all, frame_index)
+            action_loss, _, losses = model._calculate_action_losses_from_logits_eager(
+                action_logits, labels_eval, auxiliary_losses, B, T
+            )
+            frame_pairs = []
+
         future_vision_target = model._build_state_target(
             frames=frames,
             future_vision_pred=future_vision_pred,
@@ -382,20 +446,44 @@ def _forward_direct(model, batch_to_cuda, actions_in, masked_labels):
                 skip_action_decoder=True,
             )
         )
-        # a_in^0 → [B, T, F, ...] logits; take frame 0 for current-frame TF eval
+        # a_in^0 → [B, T, F, ...] logits
         action_logits_all = model.action_out_tokens_to_logits(action_out_embeddings[:, :, 0, :])
-        action_logits = GamepadDirectActionLogits(
-            buttons=action_logits_all.buttons[:, :, 0, :],
-            left_stick_x=action_logits_all.left_stick_x[:, :, 0, :],
-            left_stick_y=action_logits_all.left_stick_y[:, :, 0, :],
-            right_stick_x=action_logits_all.right_stick_x[:, :, 0, :],
-            right_stick_y=action_logits_all.right_stick_y[:, :, 0, :],
-        )
-        loss, _, losses = model._calculate_action_losses_from_logits_eager(
-            action_logits, masked_labels, auxiliary_losses, B, T
-        )
+        n_future_frames = action_logits_all.buttons.shape[2]
 
-    return loss, losses, action_logits
+        if all_future_frames:
+            frame_pairs = []
+            all_losses = []
+            loss_dicts = []
+            for i in range(n_future_frames):
+                labels_i = model._build_future_masked_labels(masked_labels, i)
+                action_logits_i = _select_direct_frame_logits(action_logits_all, i)
+                aux_i = auxiliary_losses if i == 0 else {}
+                loss_i, _, losses_i = model._calculate_action_losses_from_logits_eager(
+                    action_logits_i, labels_i, aux_i, B, T
+                )
+                frame_pairs.append((i, action_logits_i, labels_i))
+                all_losses.append(loss_i)
+                loss_dicts.append(losses_i)
+            loss = sum(all_losses) / len(all_losses)
+            losses = _average_loss_dict(loss_dicts)
+            action_logits = None
+        else:
+            if frame_index < 0 or frame_index >= n_future_frames:
+                raise ValueError(
+                    f"frame_index={frame_index} out of range [0, {n_future_frames-1}]"
+                )
+            labels_eval = (
+                model._build_future_masked_labels(masked_labels, frame_index)
+                if frame_index > 0
+                else masked_labels
+            )
+            action_logits = _select_direct_frame_logits(action_logits_all, frame_index)
+            loss, _, losses = model._calculate_action_losses_from_logits_eager(
+                action_logits, labels_eval, auxiliary_losses, B, T
+            )
+            frame_pairs = []
+
+    return loss, losses, action_logits, frame_pairs, n_future_frames
 
 
 # ---------------------------------------------------------------------------
@@ -428,6 +516,8 @@ def report_validation_metrics(
     run_id: str,
     use_wandb: bool = True,
     n_sequences: Optional[int] = None,
+    frame_index: int = 0,
+    all_future_frames: bool = False,
 ):
     BATCH_SIZE_FOR_VAL = 1
     t0 = time.time()
@@ -435,9 +525,10 @@ def report_validation_metrics(
     try:
         config = load_config(config_path, LightningPolicyConfig)
 
+        eval_mode = "all_future_frames" if all_future_frames else f"frame_index={frame_index}"
         print(
             f"[direct] validating run_id={run_id}, step={global_step}, "
-            f"checkpoint={checkpoint_path}"
+            f"checkpoint={checkpoint_path}, mode={eval_mode}"
         )
 
         if use_wandb:
@@ -498,12 +589,25 @@ def report_validation_metrics(
         # per-set accumulators
         perplexity_metrics: Dict[str, Dict] = {}
         direct_metrics: Dict[str, DirectActionMetrics] = {}
+        per_frame_direct_metrics: Dict[str, List[DirectActionMetrics]] = {}
+        n_eval_future_frames = getattr(
+            config.policy_model, "n_future_frames", config.policy_model.n_future_action_tokens
+        )
+        if all_future_frames:
+            print(f"Evaluating all future frames: 0..{n_eval_future_frames-1}")
         for name in val_dataloaders:
             perplexity_metrics[name] = {"off_perplexity": LossMetric().to(model.device)}
             direct_metrics[name] = DirectActionMetrics(
                 n_buttons=model.n_direct_buttons,
                 n_stick_bins=model.n_direct_stick_bins,
             )
+            per_frame_direct_metrics[name] = [
+                DirectActionMetrics(
+                    n_buttons=model.n_direct_buttons,
+                    n_stick_bins=model.n_direct_stick_bins,
+                )
+                for _ in range(n_eval_future_frames)
+            ]
 
         start_time = time.time()
         for val_set_name, val_dataloader in val_dataloaders.items():
@@ -520,8 +624,13 @@ def report_validation_metrics(
                     torch.inference_mode(),
                     torch.autocast(device_type="cuda", dtype=torch.bfloat16),
                 ):
-                    loss, losses, action_logits = _forward_direct(
-                        model, batch_cuda, actions_in, masked_labels
+                    loss, losses, action_logits, frame_pairs, n_future_frames = _forward_direct(
+                        model,
+                        batch_cuda,
+                        actions_in,
+                        masked_labels,
+                        frame_index=frame_index,
+                        all_future_frames=all_future_frames,
                     )
 
                 if torch.isnan(loss):
@@ -539,10 +648,21 @@ def report_validation_metrics(
                         ppl_m[key] = LossMetric().to(model.device)
                     ppl_m[key].update(cross_entropy_to_perplexity(v).item())
 
-                if isinstance(action_logits, GamepadDirectActionLogits):
-                    # torch.set_printoptions(threshold=10000, linewidth=200)
-                    # print(f"  [batch {batch_idx}] logits: {action_logits}")
-                    dir_m.update(action_logits, masked_labels)
+                if all_future_frames:
+                    if n_future_frames != n_eval_future_frames:
+                        raise ValueError(
+                            f"Runtime n_future_frames={n_future_frames} != expected {n_eval_future_frames}"
+                        )
+                    for frame_i, logits_i, labels_i in frame_pairs:
+                        dir_m.update(logits_i, labels_i)
+                        per_frame_direct_metrics[val_set_name][frame_i].update(logits_i, labels_i)
+                elif isinstance(action_logits, GamepadDirectActionLogits):
+                    labels_eval = (
+                        model._build_future_masked_labels(masked_labels, frame_index)
+                        if frame_index > 0
+                        else masked_labels
+                    )
+                    dir_m.update(action_logits, labels_eval)
 
                 if batch_idx % 100 == 0:
                     elapsed = time.time() - start_time
@@ -578,6 +698,13 @@ def report_validation_metrics(
 
             dm = dir_m.compute()
             set_results["direct_action_metrics"] = dm
+            if all_future_frames:
+                per_frame = {}
+                for frame_i in range(n_eval_future_frames):
+                    per_frame[f"frame_{frame_i:02d}"] = (
+                        per_frame_direct_metrics[val_set_name][frame_i].compute()
+                    )
+                set_results["direct_action_metrics_per_frame"] = per_frame
             print(f"\n{'='*60}")
             print(f"[{val_set_name}] Direct Action Metrics:")
             print(f"{'='*60}")
@@ -617,6 +744,15 @@ def report_validation_metrics(
                 log_data.update(
                     _flatten_direct_metrics(dm, prefix=f"{val_set_name}_validation_direct")
                 )
+                if all_future_frames:
+                    for frame_i in range(n_eval_future_frames):
+                        dmf = per_frame_direct_metrics[val_set_name][frame_i].compute()
+                        log_data.update(
+                            _flatten_direct_metrics(
+                                dmf,
+                                prefix=f"{val_set_name}_validation_direct/frame_{frame_i:02d}",
+                            )
+                        )
                 log_data["trainer/global_step"] = int(global_step)
                 wandb.log(log_data, step=int(global_step))
 
@@ -640,6 +776,8 @@ def run_validation(
     max_steps: Optional[int],
     use_wandb: bool = True,
     n_sequences: Optional[int] = None,
+    frame_index: int = 0,
+    all_future_frames: bool = False,
 ):
     run_id = wandb.util.generate_id() if use_wandb else "local"
     ckpts = find_all_checkpoints(checkpoint_dir)
@@ -653,7 +791,16 @@ def run_validation(
             continue
         if not is_step_in_range(global_step, min_steps, max_steps):
             continue
-        report_validation_metrics(checkpoint_path, config_path, global_step, run_id, use_wandb, n_sequences=n_sequences)
+        report_validation_metrics(
+            checkpoint_path,
+            config_path,
+            global_step,
+            run_id,
+            use_wandb,
+            n_sequences=n_sequences,
+            frame_index=frame_index,
+            all_future_frames=all_future_frames,
+        )
     logging.info("Validation complete.")
 
 
@@ -671,11 +818,24 @@ def main():
                         help="禁用 wandb 上报，仅保存本地 JSON")
     parser.add_argument("--n_sequences", type=int, default=None,
                         help="限制验证的轨迹序列数量，与 AR 脚本的 --n_sequences 语义对齐（默认跑完整个验证集）")
+    parser.add_argument(
+        "--frame_index",
+        type=int,
+        default=0,
+        help="仅评估指定 future frame 索引（默认 0）。当 --all_future_frames 开启时忽略。",
+    )
+    parser.add_argument(
+        "--all_future_frames",
+        action="store_true",
+        help="逐帧评估全部 future frames 并输出汇总与逐帧指标。",
+    )
     args = parser.parse_args()
     print(f"args: {args}")
     if args.min_steps is not None and args.max_steps is not None:
         if args.min_steps > args.max_steps:
             parser.error("--min_steps must be <= --max_steps")
+    if args.frame_index < 0:
+        parser.error("--frame_index must be >= 0")
 
     run_validation(
         checkpoint_dir=args.checkpoint_dir,
@@ -684,6 +844,8 @@ def main():
         max_steps=args.max_steps,
         use_wandb=not args.no_wandb,
         n_sequences=args.n_sequences,
+        frame_index=args.frame_index,
+        all_future_frames=args.all_future_frames,
     )
 
 

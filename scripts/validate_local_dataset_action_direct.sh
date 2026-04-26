@@ -12,7 +12,7 @@ exec > >(tee -a "$LOG_FILE") 2>&1
 echo "日志文件: $LOG_FILE"
 
 CONFIG_FILE="config/policy_model/150M_local_nitrogen_dataset_future_action_direct.yaml"
-# DATA_FOLDER="cuphead_one_level_3"
+# DATA_FOLDER="cuphead_one_level_1"
 DATA_FOLDER="NitroGen_cuphead_toy"
 #CHECKPOINT_PATH="output/policy_model/150M_nitrogen_cuphead_future_action_direct_F18_2head_zero_action_all/stage3_finetune/checkpoint-step=00100000.ckpt"
 # CHECKPOINT_PATH="output_20260420/policy_model/150M_nitrogen_cuphead_future_action_direct_F18_2head_zero_action_all/stage3_finetune/checkpoint-step=00100000.ckpt"
@@ -20,13 +20,15 @@ DATA_FOLDER="NitroGen_cuphead_toy"
 # CHECKPOINT_PATH="output/policy_model/150M_nitrogen_cuphead_future_action_direct_F18_2head_zero_action_v350335326/stage3_finetune/checkpoint-step=00080000.ckpt"
 # CHECKPOINT_PATH="output/policy_model/150M_nitrogen_cuphead_future_action_direct_F18_2head_zero_action_onelevel1/stage3_finetune/checkpoint-step=00030000.ckpt"
 #CHECKPOINT_PATH="output/policy_model/150M_nitrogen_cuphead_future_action_direct_F18_2head_zero_action_v350335326/stage3_finetune/checkpoint-step=00150000.ckpt"
-CHECKPOINT_PATH="output/policy_model/150M_nitrogen_cuphead_future_action_direct_F18_2head_zero_action_all/stage3_finetune/checkpoint-step=00260000.ckpt"
+CHECKPOINT_PATH="output/policy_model/150M_nitrogen_cuphead_future_action_direct_F18_2head_zero_action_v350335326/stage3_finetune/checkpoint-step=00100000.ckpt"
 TEMP_CONFIG_FILE=""
 MIN_STEPS=""
 MAX_STEPS=""
 N_SEQUENCES="72"
-GPU_ID="3"
+GPU_ID="1"
 NO_WANDB=true
+FRAME_INDEX="0"
+ALL_FUTURE_FRAMES=false
 
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -34,7 +36,7 @@ RED='\033[0;31m'
 NC='\033[0m'
 
 usage() {
-    echo "用法: bash scripts/validate_local_dataset_action_direct.sh [-d 数据集] [-c 配置] [-k checkpoint路径/目录] [-g GPU_ID] [--no_wandb] [--min_steps N] [--max_steps N]"
+    echo "用法: bash scripts/validate_local_dataset_action_direct.sh [-d 数据集] [-c 配置] [-k checkpoint路径/目录] [-g GPU_ID] [--no_wandb] [--min_steps N] [--max_steps N] [--frame_index N] [--all_future_frames]"
     echo
     echo "参数:"
     echo "  -d    验证数据集路径 (默认: cuphead_dataset_converted)"
@@ -45,6 +47,8 @@ usage() {
     echo "  --no_wandb    禁用 wandb 上报，仅保存本地 JSON"
     echo "  --min_steps   最小 step（可选，仅当 -k 指向目录时有意义）"
     echo "  --max_steps   最大 step（可选，仅当 -k 指向目录时有意义）"
+    echo "  --frame_index 仅评估指定 future frame（默认: 0）"
+    echo "  --all_future_frames 评估全部 future frames 并输出逐帧+汇总指标"
     echo "  -h    显示帮助"
     echo
     echo "示例:"
@@ -69,6 +73,8 @@ while [[ $# -gt 0 ]]; do
         --no_wandb) NO_WANDB=true; shift ;;
         --min_steps) MIN_STEPS="$2"; shift 2 ;;
         --max_steps) MAX_STEPS="$2"; shift 2 ;;
+        --frame_index) FRAME_INDEX="$2"; shift 2 ;;
+        --all_future_frames) ALL_FUTURE_FRAMES=true; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo -e "${RED}错误: 未知参数 $1${NC}"; usage; exit 1 ;;
     esac
@@ -211,6 +217,11 @@ echo -e "${GREEN}配置: $CONFIG_FILE  数据集: $DATA_FOLDER  checkpoint: $CHE
 [ -n "$MIN_STEPS" ] && echo -e "${GREEN}min_steps: $MIN_STEPS${NC}"
 [ -n "$MAX_STEPS" ] && echo -e "${GREEN}max_steps: $MAX_STEPS${NC}"
 [ -n "$N_SEQUENCES" ] && echo -e "${GREEN}n_sequences (限制): $N_SEQUENCES${NC}"
+if [ "$ALL_FUTURE_FRAMES" = true ]; then
+    echo -e "${GREEN}评估模式: all_future_frames${NC}"
+else
+    echo -e "${GREEN}评估模式: frame_index=${FRAME_INDEX}${NC}"
+fi
 echo -e "${GREEN}========================================${NC}"
 echo -e "${YELLOW}验证指标:${NC}"
 echo -e "${YELLOW}  - Perplexity (button BCE + stick CE)${NC}"
@@ -227,6 +238,8 @@ CMD=(python3 elefant/policy_model/validation_action_direct.py
 [ -n "$MAX_STEPS" ] && CMD+=(--max_steps "$MAX_STEPS")
 [ -n "$N_SEQUENCES" ] && CMD+=(--n_sequences "$N_SEQUENCES")
 [ "$NO_WANDB" = true ] && CMD+=(--no_wandb)
+[ "$ALL_FUTURE_FRAMES" = true ] && CMD+=(--all_future_frames)
+[ "$ALL_FUTURE_FRAMES" != true ] && CMD+=(--frame_index "$FRAME_INDEX")
 
 "${CMD[@]}"
 
