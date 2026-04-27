@@ -13,14 +13,16 @@ exec > >(tee -a "$LOG_FILE") 2>&1
 echo "日志文件: $LOG_FILE"
 
 CONFIG_FILE="config/policy_model/150M_local_nitrogen_dataset_future_action_direct.yaml"
-DATA_FOLDER="cuphead_one_level_1"
+# DATA_FOLDER="NitroGen_cuphead_toy"
+DATA_FOLDER="cuphead_one_level_2"
 # CHECKPOINT_PATH="output_20260420/policy_model/150M_nitrogen_cuphead_future_action_direct_F18_2head_zero_action_all/stage3_finetune/checkpoint-step=00100000.ckpt"
 #CHECKPOINT_PATH="output_20260420/policy_model/150M_nitrogen_cuphead_future_action_direct_F18_2head_zero_action_onelevel_3/stage3_finetune/checkpoint-step=00030000.ckpt"
 # CHECKPOINT_PATH="output/policy_model/150M_nitrogen_cuphead_future_action_direct_F18_2head_zero_action_v350335326/stage3_finetune/checkpoint-step=00080000.ckpt"
 # CHECKPOINT_PATH="output/policy_model/150M_nitrogen_cuphead_future_action_direct_F18_2head_zero_action_onelevel3/stage3_finetune/checkpoint-step=00030000.ckpt"
 #CHECKPOINT_PATH="output/policy_model/150M_nitrogen_cuphead_future_action_direct_F18_2head_zero_action_v350335326/stage3_finetune/checkpoint-step=00150000.ckpt"
-CHECKPOINT_PATH="output_20260425/policy_model/150M_nitrogen_cuphead_future_action_direct_F18_2head_zero_action_all/stage3_finetune/checkpoint-step=00260000.ckpt"
-N_SEQUENCES=18
+# CHECKPOINT_PATH="output_20260425/policy_model/150M_nitrogen_cuphead_future_action_direct_F18_2head_zero_action_all/stage3_finetune/checkpoint-step=00260000.ckpt"
+CHECKPOINT_PATH="output/policy_model/150M_nitrogen_cuphead_future_action_direct_F18_2head_zero_action_v350335326/stage3_finetune/checkpoint-step=00100000.ckpt"
+N_SEQUENCES=12
 GPU_ID="0"
 FULL_CAUSAL_MASK=False
 

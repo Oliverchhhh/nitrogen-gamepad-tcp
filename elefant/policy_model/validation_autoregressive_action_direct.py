@@ -515,6 +515,12 @@ def run_autoregressive_direct_validation(
                             text_tokens_embed=text_t,
                             compile=True,
                         )
+                        # if kv_cache_state and len(kv_cache_state) > 0:
+                        #     k_shape = tuple(kv_cache_state[0].k_cache.shape)
+                        #     v_shape = tuple(kv_cache_state[0].v_cache.shape)
+                            # print(
+                            #     f"kv_cache layer0 k={k_shape} v={v_shape} idx={int(idx.item())}"
+                            # )
 
                     # sampled_action: [1, n_buttons+4]  → squeeze to [n_buttons+4]
                     pred = sampled_action.squeeze(0)   # [n_buttons+4]
