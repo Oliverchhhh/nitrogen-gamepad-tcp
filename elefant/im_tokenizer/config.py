@@ -72,6 +72,13 @@ class VjepaTokenizerConfig(ConfigBase):
     # - "encoder": V-JEPA 2.0 常见 key
     checkpoint_key: str = "auto"
 
+    # 是否将每帧 patch tokens 聚合为单个全局 token。
+    # 开启后可显著降低 policy transformer 序列长度，缓解 OOM。
+    pool_to_global: bool = False
+
+    # 全局聚合后 MLP 的隐藏维度。None 时默认使用 2 * embed_dim。
+    aggregation_mlp_hidden_dim: Optional[int] = None
+
 
 class StaMoTokenizerConfig(ConfigBase):
     """
@@ -119,6 +126,84 @@ class StaMoTokenizerConfig(ConfigBase):
     output_align_dim: int = 4096
 
 
+class NitrogenSiglipTokenizerConfig(ConfigBase):
+    """
+    NitroGen 风格的 SigLIP 视觉编码器配置。
+
+    不做 pooling，直接保留 dense visual tokens（例如 256 tokens/frame）。
+    """
+
+    # 视觉编码器名称（默认与 NitroGen 常用配置一致）
+    vision_encoder_name: str = "google/siglip2-large-patch16-256"
+
+    # 本地视觉编码器目录（优先级高于 vision_encoder_name）。
+    # 例如: "./checkpoints/siglip2-large-patch16-256"
+    vision_encoder_local_path: Optional[str] = None
+
+    # 目标输入尺寸；若与实际输入不同，会先 resize 到该分辨率
+    image_size: int = 256
+
+    # 是否冻结视觉塔参数
+    frozen: bool = True
+
+    # 是否按 image processor 的 mean/std 做归一化
+    use_image_processor_norm: bool = True
+
+    # 期望每帧视觉 token 数（用于运行时一致性检查）
+    expected_n_img_tokens: Optional[int] = 256
+
+    # 期望视觉隐藏维度（用于运行时一致性检查，None 表示不检查）
+    vision_hidden_size: Optional[int] = None
+
+
+class NitrogenCheckpointTokenizerConfig(ConfigBase):
+    """
+    NitroGen checkpoint 对齐版视觉编码器配置。
+
+    编码路径：
+    image -> vision_encoder(SigLIP2) -> vl_self_attention_model(4-layer Transformer)
+    """
+
+    # NitroGen checkpoint 路径（默认使用仓库内路径）
+    checkpoint_path: str = "NitroGen_checkpoints/ng.pt"
+
+    # 视觉编码器名称（用于构建与 checkpoint 对齐的 backbone）
+    vision_encoder_name: str = "google/siglip2-large-patch16-256"
+
+    # 可选本地视觉编码器目录（优先级高于 vision_encoder_name）
+    vision_encoder_local_path: Optional[str] = None
+
+    # 模型输入图像尺寸
+    image_size: int = 256
+
+    # 是否按 image processor 的 mean/std 归一化
+    use_image_processor_norm: bool = True
+
+    # 是否冻结视觉塔和 VL mixing 模块
+    freeze_vision_encoder: bool = True
+    freeze_vl_self_attention_model: bool = True
+
+    # 运行时一致性检查（None 表示跳过检查）
+    expected_n_img_tokens: Optional[int] = 256
+    vision_hidden_size: Optional[int] = 1024
+
+    # vl_self_attention_model 结构（按 NitroGen 默认使用 4 层）
+    vl_num_layers: int = 4
+    vl_num_attention_heads: int = 16
+    vl_attention_head_dim: int = 64
+    vl_dropout: float = 0.1
+    vl_attention_bias: bool = True
+    vl_activation_fn: str = "gelu-approximate"
+    vl_upcast_attention: bool = False
+    vl_max_num_positional_embeddings: int = 512
+    vl_compute_dtype: str = "float32"
+    vl_final_dropout: bool = True
+    vl_positional_embeddings: Optional[str] = "sinusoidal"
+
+    # state_dict 加载策略
+    strict_load: bool = False
+
+
 class ImageTokenizerConfig(ConfigBase):
     type: str = "vit"
     conv_tokenizer_config: Optional[ConvTokenizerConfig] = pydantic.Field(
@@ -131,5 +216,11 @@ class ImageTokenizerConfig(ConfigBase):
         default=None
     )
     stamo_tokenizer_config: Optional[StaMoTokenizerConfig] = pydantic.Field(
+        default=None
+    )
+    nitrogen_siglip_tokenizer_config: Optional[NitrogenSiglipTokenizerConfig] = pydantic.Field(
+        default=None
+    )
+    nitrogen_checkpoint_tokenizer_config: Optional[NitrogenCheckpointTokenizerConfig] = pydantic.Field(
         default=None
     )
