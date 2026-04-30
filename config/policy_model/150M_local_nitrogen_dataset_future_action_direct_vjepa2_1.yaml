@@ -1,8 +1,8 @@
 shared:
-  output_path: output/policy_model/150M_nitrogen_cuphead_future_action_direct_F18_2head
+  output_path: output/policy_model/150M_nitrogen_cuphead_future_action_direct_vjepa2_1_F18_zero_action
   n_seq_timesteps: 200
-  frame_height: 192
-  frame_width: 192
+  frame_height: 256
+  frame_width: 256
   action_mapping_type: "gamepad_direct"
   gamepad_direct_action_mapping:
     n_stick_bins: 3
@@ -12,14 +12,25 @@ shared:
     text_embedding_shape: [1, 768]
     text_annotation_model_version: ["gemini-2.5-flash", "gemini-2.5-flash-thinking-0905"]
   tokenizer:
-    type: "conv"
-    conv_tokenizer_config:
-      num_tokens: 1
+    type: "vjepa2"
+    vjepa_tokenizer_config:
+      checkpoint_path: "data/pretrain_models/ViT-B16/vjepa2_1_vitb_dist_vitG_384.pt"
+      model_name: "vjepa2_1_vit_base_384"
+      checkpoint_key: "ema_encoder"
+      frozen: true
+      img_size: 256
+      patch_size: 16
+      tubelet_size: 2
+      num_frames: 64
+      use_hub_fallback: false
+      # 将每帧 patch tokens 聚合为 1 个全局 token，显著降低序列长度与显存占用
+      pool_to_global: true
+      # 聚合后 MLP 的隐藏维度（None 等价于 2 * transformer_dim，这里显式给出）
+      aggregation_mlp_hidden_dim: 2048
 
 inference:
   mouse_sampling_approach: "truncated_normal"
 
-# Policy Model Configuration
 policy_model:
   n_transformer_layers: 10
   n_q_head: 16
@@ -30,17 +41,14 @@ policy_model:
   attention_history_len: [200, 200, 200, 200, 200, 200, 200, 200, 200, 200]
   n_kv_sink_tokens: 0
   model_type: "dense"
-  # Single action_in token per step in the transformer sequence.
-  # The MLP head decodes this single token into n_future_frames actions at once.
+  # gamepad_direct: transformer 每步只放 1 个 action_in token
   n_future_action_tokens: 1
-  # Number of future frames decoded by the MLP head from the single a_in token.
-  # Head output: F * (n_buttons + 4*n_stick_bins) per step.
+  # 由该 token 通过 2-head MLP 直接解码未来 F 帧（按钮 BCE + 摇杆 CE）
   n_future_frames: 18
-  # 训练和推理均不输入真实动作，消除 teacher-forcing 与 AR 推理的分布差异
+  # 训练和推理均不输入真实动作，避免 teacher-forcing 分布偏移
   zero_action_input: true
   action_decoder:
     embed_dim: *transformer_dim
-
 
 stage3_finetune:
   optim:
@@ -51,14 +59,14 @@ stage3_finetune:
 
   validation_step_interval: 999999
   n_validation_steps: &n_validation_steps 0
-  save_every_n_steps: 10000
+  save_every_n_steps: 50000
   n_training_steps: 300000
   accumulate_grad_batches: 1
 
   training_dataset:
     batch_size: &stage3_batch_size 2
     local_prefix: "cuphead_dataset_converted"
-    load_video_name: "192x192.mp4"
+    load_video_name: "256x256.mp4"
     warn_on_starvation: false
     always_labelled: true
     rand_augmentation:
@@ -73,13 +81,11 @@ stage3_finetune:
     shuffled_chunks_queue_size_per_gpu: 4
     dataset_worker_prefetch_factor: 2
 
-  # Keep validation config parseable (correct key: validation_datasets),
-  # but current training does not run validation because n_validation_steps=0.
   validation_datasets:
     - validation_name: "default_validation"
-      batch_size: &validation_stage3_batch_size 2
+      batch_size: *stage3_batch_size
       local_prefix: "cuphead_dataset_converted"
-      load_video_name: "192x192.mp4"
+      load_video_name: "256x256.mp4"
       n_preprocess_threads_per_gpu: &validation_stage3_n_preprocess_threads_per_gpu 8
       preprocessed_chunks_queue_size_per_gpu: &validation_stage3_preprocessed_chunks_queue_size_per_gpu 1
       shuffled_chunks_queue_size_per_gpu: &validation_stage3_shuffled_chunks_queue_size 1
@@ -87,9 +93,8 @@ stage3_finetune:
       warn_on_starvation: false
       always_labelled: true
 
-
 wandb:
   enabled: True
   entity: "zjut-cv"
   project: "policy_model"
-  exp_name: "150M-nitrogen-cuphead-future-action-direct-F18-2head"
+  exp_name: "150M-nitrogen-cuphead-future-action-direct-vjepa2_1-F18-zero-action"

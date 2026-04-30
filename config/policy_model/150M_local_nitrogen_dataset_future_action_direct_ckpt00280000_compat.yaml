@@ -35,9 +35,9 @@ policy_model:
   n_future_action_tokens: 1
   # Number of future frames decoded by the MLP head from the single a_in token.
   # Head output: F * (n_buttons + 4*n_stick_bins) per step.
-  n_future_frames: 18
+  n_future_frames: 1
   # 训练和推理均不输入真实动作，消除 teacher-forcing 与 AR 推理的分布差异
-  zero_action_input: true
+  zero_action_input: false
   action_decoder:
     embed_dim: *transformer_dim
 
@@ -51,7 +51,7 @@ stage3_finetune:
 
   validation_step_interval: 999999
   n_validation_steps: &n_validation_steps 0
-  save_every_n_steps: 10000
+  save_every_n_steps: 50000
   n_training_steps: 300000
   accumulate_grad_batches: 1
 
