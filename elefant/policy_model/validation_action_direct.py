@@ -518,6 +518,7 @@ def report_validation_metrics(
     n_sequences: Optional[int] = None,
     frame_index: int = 0,
     all_future_frames: bool = False,
+    data_folder: Optional[str] = None,
 ):
     BATCH_SIZE_FOR_VAL = 1
     t0 = time.time()
@@ -725,7 +726,14 @@ def report_validation_metrics(
 
         # ---- save JSON ----
         output_dir = os.path.dirname(checkpoint_path)
-        json_path = os.path.join(output_dir, f"validation_direct_step{global_step:08d}.json")
+        if data_folder:
+            # 用数据集目录的最后一级名称作为后缀，去掉路径分隔符
+            dataset_suffix = "_" + os.path.basename(data_folder.rstrip("/\\"))
+        else:
+            dataset_suffix = ""
+        json_path = os.path.join(
+            output_dir, f"validation_direct_step{global_step:08d}{dataset_suffix}.json"
+        )
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(all_results, f, indent=2, ensure_ascii=False)
         print(f"Saved: {json_path}")
@@ -778,6 +786,7 @@ def run_validation(
     n_sequences: Optional[int] = None,
     frame_index: int = 0,
     all_future_frames: bool = False,
+    data_folder: Optional[str] = None,
 ):
     run_id = wandb.util.generate_id() if use_wandb else "local"
     ckpts = find_all_checkpoints(checkpoint_dir)
@@ -800,6 +809,7 @@ def run_validation(
             n_sequences=n_sequences,
             frame_index=frame_index,
             all_future_frames=all_future_frames,
+            data_folder=data_folder,
         )
     logging.info("Validation complete.")
 
@@ -829,6 +839,12 @@ def main():
         action="store_true",
         help="逐帧评估全部 future frames 并输出汇总与逐帧指标。",
     )
+    parser.add_argument(
+        "--data_folder",
+        type=str,
+        default=None,
+        help="验证数据集路径，用于在输出 JSON 文件名中附加数据集名称后缀。",
+    )
     args = parser.parse_args()
     print(f"args: {args}")
     if args.min_steps is not None and args.max_steps is not None:
@@ -846,6 +862,7 @@ def main():
         n_sequences=args.n_sequences,
         frame_index=args.frame_index,
         all_future_frames=args.all_future_frames,
+        data_folder=args.data_folder,
     )
 
 

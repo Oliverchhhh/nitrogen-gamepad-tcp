@@ -709,10 +709,12 @@ class PolicyCausalTransformer(torch.nn.Module):
         if self.config.zero_action_input:
             # No Pass 2: KV cache already written with dummy zeros in Pass 1.
             # This matches training behaviour where real actions are never fed in.
+            # print("No Pass 2: KV cache already written with dummy zeros in Pass 1.")
             next_idx = input_pos[-1] + 1
             return sampled_action, next_idx, kv_cache_state
 
         # ── Pass 2: fill in real action embeddings, update KV cache ──
+        # print("Pass 2: fill in real action embeddings, update KV cache")
         action_embeddings_in = action_in_to_tokens_fn(sampled_action_reshaped)
         action_embeddings_in = action_embeddings_in.view(
             B, self.config.n_action_tokens, self.config.embed_dim

@@ -561,7 +561,11 @@ def run_autoregressive_direct_validation(
     # 将结果保存到 checkpoint 同目录，文件名含 step 编号便于追踪
     output_dir = os.path.dirname(checkpoint_path)
     step_str = os.path.basename(checkpoint_path).split("step=")[-1].split(".")[0]
-    json_path = os.path.join(output_dir, f"validation_ar_direct_step{step_str}.json")
+    if data_folder:
+        dataset_suffix = "_" + os.path.basename(data_folder.rstrip("/\\"))
+    else:
+        dataset_suffix = ""
+    json_path = os.path.join(output_dir, f"validation_ar_direct_step{step_str}{dataset_suffix}.json")
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(all_results, f, indent=2, ensure_ascii=False)
     print(f"\nAR-direct validation results saved to: {json_path}")

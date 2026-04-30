@@ -854,7 +854,7 @@ class PolicyModelTrainer(ModelFreePolicy):
             F_dec = self.n_direct_future_frames
             S = self.n_direct_stick_bins
             k = self.n_direct_buttons
-
+            # print(f"f_dec: {F_dec}, s: {S}, k: {k}")
             feat = self.direct_action_mlp(action_out_tokens)   # [B, T, mlp_out]
             btn_logits_flat = self.direct_button_head(feat)     # [B, T, F*k]
             stick_logits_flat = self.direct_stick_head(feat)    # [B, T, F*4*S]
@@ -862,7 +862,6 @@ class PolicyModelTrainer(ModelFreePolicy):
             B_dim, T_dim, _ = action_out_tokens.shape
             btn_logits   = btn_logits_flat.view(B_dim, T_dim, F_dec, k)
             stick_logits = stick_logits_flat.view(B_dim, T_dim, F_dec, 4 * S)
-
             return GamepadDirectActionLogits(
                 buttons=btn_logits,
                 left_stick_x=stick_logits[..., :S],
@@ -1113,9 +1112,14 @@ class PolicyModelTrainer(ModelFreePolicy):
             ).sum() / btn_mask.sum().clamp(min=1)
 
             def _stick_loss(logits, label_slice):
+                labels = label_slice.reshape(-1)
+                valid_count = (labels != -100).sum()
+                if valid_count.item() == 0:
+                    # Avoid NaN from CE(mean) when all targets are ignore_index.
+                    return logits.new_zeros(())
                 return F.cross_entropy(
                     logits.view(-1, self.n_direct_stick_bins),
-                    label_slice.reshape(-1),
+                    labels,
                     ignore_index=-100,
                 )
 
