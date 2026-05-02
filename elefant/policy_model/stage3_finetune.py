@@ -1897,6 +1897,8 @@ class Stage3FutureVisionLightning(PolicyModelTrainer):
                     n_action_tokens=self.transformer_n_action_tokens,
                     text_token_size=self.text_token_size,
                     text_tokenizer_embed_dim=self.text_tokenizer_embed_dim,
+                    zero_action_input=self.config.policy_model.zero_action_input,
+                    n_future_frames=self.config.policy_model.n_future_frames,
                 ),
                 image_tokenizer=self.image_tokenizer,
                 inference_mode=self.inference_mode,

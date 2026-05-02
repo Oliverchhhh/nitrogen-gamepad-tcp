@@ -29,7 +29,8 @@ policy_model:
   attention_history_len: [200, 200, 200, 200, 200, 200, 200, 200, 200, 200]
   n_kv_sink_tokens: 0
   model_type: "dense"
-  n_future_action_tokens: 18
+  n_future_action_tokens: 1
+  n_future_frames: 18
   zero_action_input: true
   action_decoder:
     embed_dim: *transformer_dim

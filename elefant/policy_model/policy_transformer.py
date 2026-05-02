@@ -1198,6 +1198,7 @@ class PolicyFutureCausalTransformer(PolicyCausalTransformer):
         empty_sampled_action_fn: Callable = None,
         reshape_structured_action_fn: Callable = None,
         action_in_to_tokens_fn: Callable = None,
+        direct_action_head_fn: Callable = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         B, T, C, H, W = img.shape
         eager_assert(T, 1)
@@ -1230,7 +1231,7 @@ class PolicyFutureCausalTransformer(PolicyCausalTransformer):
 
         batch_thinking_pos_tokens = self.thinking_pos_tokens.repeat(B, 1, 1)
         batch_state_out_token = self.state_out_token.repeat(B, 1, 1)
-        batch_action_out_token = self.action_out_token.repeat(B, 1, 1)
+        batch_action_out_token = self.action_out_tokens.repeat(B, 1, 1)
         dummy_action_embeddings_in = torch.zeros(
             B,
             self.config.n_action_tokens,
@@ -1263,21 +1264,22 @@ class PolicyFutureCausalTransformer(PolicyCausalTransformer):
             + 1
         )
         action_token_out = y[:, action_out_position : action_out_position + 1]
-        sampled_action = self.action_decoder.autogressive_sample(
-            action_token_out,
-            action_sampler,
-            empty_sampled_action_fn,
-            reshape_structured_action_fn,
-            inference_mode=True,
-        )
+        if direct_action_head_fn is not None:
+            sampled_action = direct_action_head_fn(action_token_out)
+        else:
+            sampled_action = self.action_decoder.autogressive_sample(
+                action_token_out,
+                action_sampler,
+                empty_sampled_action_fn,
+                reshape_structured_action_fn,
+                inference_mode=True,
+            )
         sampled_action_reshaped = pytree.tree_map(
             lambda x: x.unsqueeze(0), sampled_action
         )
 
         if self.config.zero_action_input:
-            # No Pass 2: KV cache already written with dummy zeros in Pass 1.
             next_idx = input_pos[-1] + 1
-            # future_vision_pred not available without Pass 2; return zeros as placeholder
             future_vision_pred = torch.zeros(
                 B, 1, self.config.embed_dim,
                 device=img.device, dtype=img.dtype,
