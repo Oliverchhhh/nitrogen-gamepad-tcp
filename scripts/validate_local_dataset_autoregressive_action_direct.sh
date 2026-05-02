@@ -12,17 +12,20 @@ LOG_FILE="${LOG_DIR}/validate_ar_action_direct_${TIMESTAMP}.log"
 exec > >(tee -a "$LOG_FILE") 2>&1
 echo "日志文件: $LOG_FILE"
 
-CONFIG_FILE="config/policy_model/150M_local_nitrogen_dataset_future_action_direct.yaml"
-# DATA_FOLDER="NitroGen_cuphead_toy"
-DATA_FOLDER="cuphead_one_level_2"
+CONFIG_FILE="config/policy_model/600M_local_nitrogen_dataset_future_action_direct.yaml"
+# CONFIG_FILE="config/policy_model/150M_local_nitrogen_dataset_future_action_direct_ckpt00280000_compat.yaml"
+DATA_FOLDER="NitroGen_cuphead_toy"
+# DATA_FOLDER="cuphead_one_level_3"
 # CHECKPOINT_PATH="output_20260420/policy_model/150M_nitrogen_cuphead_future_action_direct_F18_2head_zero_action_all/stage3_finetune/checkpoint-step=00100000.ckpt"
 #CHECKPOINT_PATH="output_20260420/policy_model/150M_nitrogen_cuphead_future_action_direct_F18_2head_zero_action_onelevel_3/stage3_finetune/checkpoint-step=00030000.ckpt"
 # CHECKPOINT_PATH="output/policy_model/150M_nitrogen_cuphead_future_action_direct_F18_2head_zero_action_v350335326/stage3_finetune/checkpoint-step=00080000.ckpt"
 # CHECKPOINT_PATH="output/policy_model/150M_nitrogen_cuphead_future_action_direct_F18_2head_zero_action_onelevel3/stage3_finetune/checkpoint-step=00030000.ckpt"
 #CHECKPOINT_PATH="output/policy_model/150M_nitrogen_cuphead_future_action_direct_F18_2head_zero_action_v350335326/stage3_finetune/checkpoint-step=00150000.ckpt"
-# CHECKPOINT_PATH="output_20260425/policy_model/150M_nitrogen_cuphead_future_action_direct_F18_2head_zero_action_all/stage3_finetune/checkpoint-step=00260000.ckpt"
-CHECKPOINT_PATH="output/policy_model/150M_nitrogen_cuphead_future_action_direct_F18_2head_zero_action_v350335326/stage3_finetune/checkpoint-step=00100000.ckpt"
-N_SEQUENCES=12
+#CHECKPOINT_PATH="output_20260425/policy_model/150M_nitrogen_cuphead_future_action_direct_F1_2head_action_all/stage3_finetune/checkpoint-step=00260000.ckpt"
+# CHECKPOINT_PATH="output/policy_model/150M_nitrogen_cuphead_future_action_direct_F18_2head_zero_action_v350335326/stage3_finetune/checkpoint-step=00100000.ckpt"
+# CHECKPOINT_PATH="output/policy_model/150M_nitrogen_cuphead_future_action_direct_F18_2head_zero_action_all/stage3_finetune/checkpoint-step=00300000.ckpt"
+CHECKPOINT_PATH="output/policy_model/600M_nitrogen_cuphead_future_action_direct_F18_2head_zero_action_all/stage3_finetune/checkpoint-step=00050000.ckpt"
+N_SEQUENCES=72
 GPU_ID="0"
 FULL_CAUSAL_MASK=False
 
@@ -131,7 +134,9 @@ cleanup_gpu() {
 }
 trap cleanup_gpu EXIT INT TERM
 
-python3 elefant/policy_model/validation_autoregressive_action_direct.py \
+# python3 elefant/policy_model/validation_autoregressive_action_direct.py \
+# python elefant/policy_model/validation_autoregressive_action.py \
+python elefant/policy_model/validation_autoregressive_action_direct.py \
     --checkpoint_path "$CHECKPOINT_PATH" \
     --config_path "$CONFIG_FILE" \
     --data_folder "$DATA_FOLDER" \

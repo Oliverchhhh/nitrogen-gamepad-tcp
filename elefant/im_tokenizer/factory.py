@@ -6,6 +6,8 @@ from elefant.im_tokenizer.tokenizer import (
     DinoV2Tokenizer,
     Vjepa2Tokenizer,
     StaMoTokenizer,
+    NitrogenSiglipTokenizer,
+    NitrogenCheckpointTokenizer,
 )
 
 
@@ -26,5 +28,9 @@ def get_tokenizer(
         return Vjepa2Tokenizer(config, frame_height, frame_width, embed_dim)
     elif config.type == "stamo":
         return StaMoTokenizer(config, frame_height, frame_width, embed_dim)
+    elif config.type == "nitrogen_siglip":
+        return NitrogenSiglipTokenizer(config, frame_height, frame_width, embed_dim)
+    elif config.type == "nitrogen_checkpoint":
+        return NitrogenCheckpointTokenizer(config, frame_height, frame_width, embed_dim)
     else:
         raise ValueError(f"Unknown tokenizer: {config.type}")

@@ -1,6 +1,7 @@
 import logging
 import os
 from abc import abstractmethod
+from pathlib import Path
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -12,6 +13,7 @@ from elefant.modules import LayerNormF32
 from elefant.im_tokenizer import conv_tokenizer
 from elefant.im_tokenizer.base_tokenizer import ImageBaseTokenizer
 from typing import Tuple
+from transformers import AutoImageProcessor, AutoModel, SiglipVisionModel
 
 
 def img_to_patch(x, patch_size, flatten_channels=True):
@@ -275,6 +277,455 @@ class StaMoTokenizer(ImageBaseTokenizer):
         return compressed
 
 
+class NitrogenSiglipTokenizer(ImageBaseTokenizer):
+    """
+    NitroGen 风格 SigLIP tokenizer：
+    - 保留 dense visual tokens（不做 pooling）
+    - 若视觉维度与 policy embed_dim 不一致，自动线性投影
+    """
+
+    def __init__(
+        self,
+        config: ImageTokenizerConfig,
+        frame_height: int,
+        frame_width: int,
+        embed_dim: int,
+    ):
+        super().__init__(config)
+
+        if config.nitrogen_siglip_tokenizer_config is None:
+            raise ValueError(
+                "nitrogen_siglip_tokenizer_config must be provided when type='nitrogen_siglip'"
+            )
+
+        siglip_cfg = config.nitrogen_siglip_tokenizer_config
+        self.siglip_cfg = siglip_cfg
+        self.frame_height = frame_height
+        self.frame_width = frame_width
+        self.embed_dim = embed_dim
+        self.target_img_size = siglip_cfg.image_size
+
+        self.model_source = siglip_cfg.vision_encoder_name
+        local_files_only = False
+        if siglip_cfg.vision_encoder_local_path:
+            local_path = Path(siglip_cfg.vision_encoder_local_path)
+            if not local_path.exists():
+                raise ValueError(
+                    f"vision_encoder_local_path does not exist: {siglip_cfg.vision_encoder_local_path}"
+                )
+            self.model_source = str(local_path)
+            local_files_only = True
+
+        self.image_processor = AutoImageProcessor.from_pretrained(
+            self.model_source,
+            local_files_only=local_files_only,
+        )
+        self.image_mean = getattr(self.image_processor, "image_mean", [0.5, 0.5, 0.5])
+        self.image_std = getattr(self.image_processor, "image_std", [0.5, 0.5, 0.5])
+        self.use_image_processor_norm = siglip_cfg.use_image_processor_norm
+
+        if "siglip" in siglip_cfg.vision_encoder_name.lower():
+            model = SiglipVisionModel.from_pretrained(
+                self.model_source,
+                local_files_only=local_files_only,
+            )
+            self.vision_encoder = model.vision_model
+        else:
+            self.vision_encoder = AutoModel.from_pretrained(
+                self.model_source,
+                local_files_only=local_files_only,
+            )
+
+        if siglip_cfg.frozen:
+            self.vision_encoder.eval()
+            for param in self.vision_encoder.parameters():
+                param.requires_grad = False
+
+        # 通过 dummy forward 确定 token 数和视觉维度，确保与主模型接口一致。
+        with torch.no_grad():
+            dummy = torch.zeros(1, 3, self.target_img_size, self.target_img_size)
+            dummy_out = self._encode_vision(dummy)
+            if dummy_out.ndim != 3:
+                raise ValueError(
+                    f"NitrogenSiglipTokenizer expects 3D output [B, N, D], got shape {tuple(dummy_out.shape)}"
+                )
+            _, n_tokens, vision_dim = dummy_out.shape
+
+        if (
+            siglip_cfg.expected_n_img_tokens is not None
+            and n_tokens != siglip_cfg.expected_n_img_tokens
+        ):
+            raise ValueError(
+                f"Unexpected number of visual tokens from {siglip_cfg.vision_encoder_name}: "
+                f"got {n_tokens}, expected {siglip_cfg.expected_n_img_tokens}"
+            )
+        if (
+            siglip_cfg.vision_hidden_size is not None
+            and vision_dim != siglip_cfg.vision_hidden_size
+        ):
+            raise ValueError(
+                f"Unexpected vision hidden size from {siglip_cfg.vision_encoder_name}: "
+                f"got {vision_dim}, expected {siglip_cfg.vision_hidden_size}"
+            )
+
+        self.n_img_tokens = n_tokens
+        self.vision_hidden_size = vision_dim
+
+        if vision_dim != embed_dim:
+            self.proj_to_embed_dim = nn.Linear(vision_dim, embed_dim)
+            logging.info(
+                "NitrogenSiglipTokenizer: adding projection layer %s -> %s",
+                vision_dim,
+                embed_dim,
+            )
+        else:
+            self.proj_to_embed_dim = None
+
+    def _encode_vision(self, x: torch.Tensor) -> torch.Tensor:
+        outputs = self.vision_encoder(pixel_values=x)
+        if isinstance(outputs, dict):
+            if "last_hidden_state" not in outputs:
+                raise ValueError(
+                    f"Vision encoder output does not contain last_hidden_state. Keys: {list(outputs.keys())}"
+                )
+            return outputs["last_hidden_state"]
+        if not hasattr(outputs, "last_hidden_state"):
+            raise ValueError(
+                f"Vision encoder output does not have last_hidden_state: {type(outputs)}"
+            )
+        return outputs.last_hidden_state
+
+    def _normalize(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.use_image_processor_norm:
+            return x
+        mean = torch.tensor(self.image_mean, dtype=x.dtype, device=x.device).view(1, -1, 1, 1)
+        std = torch.tensor(self.image_std, dtype=x.dtype, device=x.device).view(1, -1, 1, 1)
+        return (x - mean) / std
+
+    def get_n_img_tokens(self) -> int:
+        return self.n_img_tokens
+
+    def forward(self, input_tensor: torch.Tensor) -> torch.Tensor:
+        B, T, C, H, W = input_tensor.shape
+
+        x = input_tensor.reshape(B * T, C, H, W).to(torch.float32)
+        if H != self.target_img_size or W != self.target_img_size:
+            x = F.interpolate(
+                x,
+                size=(self.target_img_size, self.target_img_size),
+                mode="bilinear",
+                align_corners=False,
+            )
+        x = self._normalize(x)
+
+        with torch.set_grad_enabled(self.training and not self.siglip_cfg.frozen):
+            features = self._encode_vision(x)
+
+        eager_assert(features.shape[0], B * T)
+        eager_assert(features.shape[1], self.n_img_tokens)
+        eager_assert(features.shape[2], self.vision_hidden_size)
+
+        if self.proj_to_embed_dim is not None:
+            features = self.proj_to_embed_dim(features)
+
+        features = features.view(B, T, self.n_img_tokens, self.embed_dim)
+        return features
+
+
+class NitrogenCheckpointTokenizer(ImageBaseTokenizer):
+    """
+    NitroGen checkpoint 对齐版视觉 encoder：
+    vision_encoder(SigLIP2) -> vl_self_attention_model(4-layer Transformer)
+    """
+
+    def __init__(
+        self,
+        config: ImageTokenizerConfig,
+        frame_height: int,
+        frame_width: int,
+        embed_dim: int,
+    ):
+        super().__init__(config)
+
+        if config.nitrogen_checkpoint_tokenizer_config is None:
+            raise ValueError(
+                "nitrogen_checkpoint_tokenizer_config must be provided when type='nitrogen_checkpoint'"
+            )
+
+        ckpt_cfg = config.nitrogen_checkpoint_tokenizer_config
+        self.ckpt_cfg = ckpt_cfg
+        self.frame_height = frame_height
+        self.frame_width = frame_width
+        self.embed_dim = embed_dim
+        self.target_img_size = ckpt_cfg.image_size
+        self.vision_hidden_size = ckpt_cfg.vision_hidden_size
+
+        # Dynamically add third_party/NitroGen to sys.path, then import VL mixing module.
+        import sys
+
+        nitrogen_path = os.getenv("NITROGEN_PATH")
+        if nitrogen_path is None:
+            candidate_paths = [
+                Path(__file__).resolve().parents[2] / "third_party" / "NitroGen",
+                Path(__file__).resolve().parents[2] / "third_part" / "NitroGen",
+            ]
+            for p in candidate_paths:
+                if p.exists():
+                    nitrogen_path = str(p)
+                    break
+        if not nitrogen_path or not os.path.exists(nitrogen_path):
+            raise ValueError(
+                "Cannot locate NitroGen source. Set NITROGEN_PATH or place NitroGen under third_party/NitroGen."
+            )
+        if nitrogen_path not in sys.path:
+            sys.path.insert(0, nitrogen_path)
+
+        from nitrogen.flow_matching_transformer.modules import (
+            SelfAttentionTransformer,
+            SelfAttentionTransformerConfig,
+        )
+
+        self.model_source = ckpt_cfg.vision_encoder_name
+        local_files_only = False
+        if ckpt_cfg.vision_encoder_local_path:
+            local_path = Path(ckpt_cfg.vision_encoder_local_path)
+            if not local_path.exists():
+                raise ValueError(
+                    f"vision_encoder_local_path does not exist: {ckpt_cfg.vision_encoder_local_path}"
+                )
+            self.model_source = str(local_path)
+            local_files_only = True
+
+        self.image_processor = AutoImageProcessor.from_pretrained(
+            self.model_source,
+            local_files_only=local_files_only,
+        )
+        self.image_mean = getattr(self.image_processor, "image_mean", [0.5, 0.5, 0.5])
+        self.image_std = getattr(self.image_processor, "image_std", [0.5, 0.5, 0.5])
+        self.use_image_processor_norm = ckpt_cfg.use_image_processor_norm
+
+        if "siglip" in ckpt_cfg.vision_encoder_name.lower():
+            model = SiglipVisionModel.from_pretrained(
+                self.model_source,
+                local_files_only=local_files_only,
+            )
+            self.vision_encoder = model.vision_model
+        else:
+            self.vision_encoder = AutoModel.from_pretrained(
+                self.model_source,
+                local_files_only=local_files_only,
+            )
+
+        vl_cfg = SelfAttentionTransformerConfig(
+            num_attention_heads=ckpt_cfg.vl_num_attention_heads,
+            attention_head_dim=ckpt_cfg.vl_attention_head_dim,
+            num_layers=ckpt_cfg.vl_num_layers,
+            dropout=ckpt_cfg.vl_dropout,
+            attention_bias=ckpt_cfg.vl_attention_bias,
+            activation_fn=ckpt_cfg.vl_activation_fn,
+            upcast_attention=ckpt_cfg.vl_upcast_attention,
+            max_num_positional_embeddings=ckpt_cfg.vl_max_num_positional_embeddings,
+            compute_dtype=ckpt_cfg.vl_compute_dtype,
+            final_dropout=ckpt_cfg.vl_final_dropout,
+            positional_embeddings=ckpt_cfg.vl_positional_embeddings,
+        )
+        self.vl_self_attention_model = SelfAttentionTransformer(config=vl_cfg)
+
+        checkpoint_path = Path(ckpt_cfg.checkpoint_path)
+        if not checkpoint_path.exists():
+            raise ValueError(f"Checkpoint not found: {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        state_dict = checkpoint["model"] if isinstance(checkpoint, dict) and "model" in checkpoint else checkpoint
+
+        vision_state_dict = {
+            k.removeprefix("vision_encoder."): v
+            for k, v in state_dict.items()
+            if k.startswith("vision_encoder.")
+        }
+        vl_state_dict = {
+            k.removeprefix("vl_self_attention_model."): v
+            for k, v in state_dict.items()
+            if k.startswith("vl_self_attention_model.")
+        }
+        if not vision_state_dict:
+            raise ValueError(f"No 'vision_encoder.*' keys found in checkpoint: {checkpoint_path}")
+        if not vl_state_dict:
+            raise ValueError(f"No 'vl_self_attention_model.*' keys found in checkpoint: {checkpoint_path}")
+
+        vision_msg = self.vision_encoder.load_state_dict(vision_state_dict, strict=ckpt_cfg.strict_load)
+        vl_msg = self.vl_self_attention_model.load_state_dict(vl_state_dict, strict=ckpt_cfg.strict_load)
+        if vision_msg.missing_keys:
+            logging.warning("NitrogenCheckpointTokenizer vision missing keys: %s", vision_msg.missing_keys)
+        if vision_msg.unexpected_keys:
+            logging.warning("NitrogenCheckpointTokenizer vision unexpected keys: %s", vision_msg.unexpected_keys)
+        if vl_msg.missing_keys:
+            logging.warning("NitrogenCheckpointTokenizer vl mixer missing keys: %s", vl_msg.missing_keys)
+        if vl_msg.unexpected_keys:
+            logging.warning("NitrogenCheckpointTokenizer vl mixer unexpected keys: %s", vl_msg.unexpected_keys)
+
+        if ckpt_cfg.freeze_vision_encoder:
+            self.vision_encoder.eval()
+            for param in self.vision_encoder.parameters():
+                param.requires_grad = False
+        if ckpt_cfg.freeze_vl_self_attention_model:
+            self.vl_self_attention_model.eval()
+            for param in self.vl_self_attention_model.parameters():
+                param.requires_grad = False
+
+        with torch.no_grad():
+            dummy = torch.zeros(1, 3, self.target_img_size, self.target_img_size)
+            dummy_features = self._encode_vision(dummy)
+            if dummy_features.ndim != 3:
+                raise ValueError(
+                    f"NitrogenCheckpointTokenizer expects 3D output [B, N, D], got shape {tuple(dummy_features.shape)}"
+                )
+            _, n_tokens, hidden_dim = dummy_features.shape
+            dummy_mixed = self.vl_self_attention_model(dummy_features)
+            if dummy_mixed.shape[-1] != hidden_dim:
+                raise ValueError(
+                    f"Unexpected VL mixer output dim {dummy_mixed.shape[-1]}, expected {hidden_dim}"
+                )
+
+        if (
+            ckpt_cfg.expected_n_img_tokens is not None
+            and n_tokens != ckpt_cfg.expected_n_img_tokens
+        ):
+            raise ValueError(
+                f"Unexpected number of visual tokens: got {n_tokens}, expected {ckpt_cfg.expected_n_img_tokens}"
+            )
+        if (
+            ckpt_cfg.vision_hidden_size is not None
+            and hidden_dim != ckpt_cfg.vision_hidden_size
+        ):
+            raise ValueError(
+                f"Unexpected vision hidden size: got {hidden_dim}, expected {ckpt_cfg.vision_hidden_size}"
+            )
+
+        self.n_img_tokens = n_tokens
+        self.vision_hidden_size = hidden_dim
+
+        if hidden_dim != embed_dim:
+            self.proj_to_embed_dim = nn.Linear(hidden_dim, embed_dim)
+            logging.info(
+                "NitrogenCheckpointTokenizer: adding projection layer %s -> %s",
+                hidden_dim,
+                embed_dim,
+            )
+        else:
+            self.proj_to_embed_dim = None
+
+    def _encode_vision(self, x: torch.Tensor) -> torch.Tensor:
+        outputs = self.vision_encoder(pixel_values=x)
+        if isinstance(outputs, dict):
+            if "last_hidden_state" not in outputs:
+                raise ValueError(
+                    f"Vision encoder output does not contain last_hidden_state. Keys: {list(outputs.keys())}"
+                )
+            return outputs["last_hidden_state"]
+        if not hasattr(outputs, "last_hidden_state"):
+            raise ValueError(
+                f"Vision encoder output does not have last_hidden_state: {type(outputs)}"
+            )
+        return outputs.last_hidden_state
+
+    def _normalize(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.use_image_processor_norm:
+            return x
+        mean = torch.tensor(self.image_mean, dtype=x.dtype, device=x.device).view(1, -1, 1, 1)
+        std = torch.tensor(self.image_std, dtype=x.dtype, device=x.device).view(1, -1, 1, 1)
+        return (x - mean) / std
+
+    def get_n_img_tokens(self) -> int:
+        return self.n_img_tokens
+
+    def forward_legacy(self, input_tensor: torch.Tensor) -> torch.Tensor:
+        B, T, C, H, W = input_tensor.shape
+        vl_seq_len = T * self.n_img_tokens
+        vl_max_seq_len = self.ckpt_cfg.vl_max_num_positional_embeddings
+        if vl_seq_len > vl_max_seq_len:
+            raise ValueError(
+                "NitrogenCheckpointTokenizer sequence length exceeds vl positional embedding limit: "
+                f"T={T}, n_img_tokens={self.n_img_tokens}, T*N={vl_seq_len}, "
+                f"vl_max_num_positional_embeddings={vl_max_seq_len}. "
+                "Increase vl_max_num_positional_embeddings or reduce n_seq_timesteps."
+            )
+
+        x = input_tensor.reshape(B * T, C, H, W).to(torch.float32)
+        if H != self.target_img_size or W != self.target_img_size:
+            x = F.interpolate(
+                x,
+                size=(self.target_img_size, self.target_img_size),
+                mode="bilinear",
+                align_corners=False,
+            )
+        x = self._normalize(x)
+
+        with torch.set_grad_enabled(self.training and not self.ckpt_cfg.freeze_vision_encoder):
+            features = self._encode_vision(x)  # [B*T, N, D]
+
+        features = features.view(B, T, self.n_img_tokens, self.vision_hidden_size)
+        vl_input = features.reshape(B, T * self.n_img_tokens, self.vision_hidden_size)
+        with torch.set_grad_enabled(
+            self.training and not self.ckpt_cfg.freeze_vl_self_attention_model
+        ):
+            vl_mixed = self.vl_self_attention_model(vl_input)
+        features = vl_mixed.view(B, T, self.n_img_tokens, self.vision_hidden_size)
+
+        if self.proj_to_embed_dim is not None:
+            features = self.proj_to_embed_dim(features)
+
+        eager_assert(features.shape[0], B)
+        eager_assert(features.shape[1], T)
+        eager_assert(features.shape[2], self.n_img_tokens)
+        eager_assert(features.shape[3], self.embed_dim)
+        return features
+    
+    def forward(self, input_tensor: torch.Tensor) -> torch.Tensor:
+        B, T, C, H, W = input_tensor.shape
+        # vl_seq_len = T * self.n_img_tokens
+        # vl_max_seq_len = self.ckpt_cfg.vl_max_num_positional_embeddings
+        # if vl_seq_len > vl_max_seq_len:
+        #     raise ValueError(
+        #         "NitrogenCheckpointTokenizer sequence length exceeds vl positional embedding limit: "
+        #         f"T={T}, n_img_tokens={self.n_img_tokens}, T*N={vl_seq_len}, "
+        #         f"vl_max_num_positional_embeddings={vl_max_seq_len}. "
+        #         "Increase vl_max_num_positional_embeddings or reduce n_seq_timesteps."
+        #     )
+
+        x = input_tensor.reshape(B * T, C, H, W).to(torch.float32)
+        if H != self.target_img_size or W != self.target_img_size:
+            x = F.interpolate(
+                x,
+                size=(self.target_img_size, self.target_img_size),
+                mode="bilinear",
+                align_corners=False,
+            )
+        x = self._normalize(x)
+
+        with torch.set_grad_enabled(self.training and not self.ckpt_cfg.freeze_vision_encoder):
+            features = self._encode_vision(x)  # [B*T, N, D]
+
+        features = features.view(B, T, self.n_img_tokens, self.vision_hidden_size)
+        # vl_input = features.reshape(B, T * self.n_img_tokens, self.vision_hidden_size)
+        # print(features.shape)
+        vl_input = features.reshape(B*T, self.n_img_tokens, self.vision_hidden_size) #只进行单帧图像内的Visian 融合
+        with torch.set_grad_enabled(
+            self.training and not self.ckpt_cfg.freeze_vl_self_attention_model
+        ):
+            vl_mixed = self.vl_self_attention_model(vl_input)
+        features = vl_mixed.view(B, T, self.n_img_tokens, self.vision_hidden_size)
+
+        if self.proj_to_embed_dim is not None:
+            features = self.proj_to_embed_dim(features)
+
+        eager_assert(features.shape[0], B)
+        eager_assert(features.shape[1], T)
+        eager_assert(features.shape[2], self.n_img_tokens)
+        eager_assert(features.shape[3], self.embed_dim)
+        return features
+    
+
+
 class Vjepa2Tokenizer(ImageBaseTokenizer):
     """
     V-JEPA 2 Tokenizer - 使用 V-JEPA 2 作为视觉编码器
@@ -371,11 +822,10 @@ class Vjepa2Tokenizer(ImageBaseTokenizer):
         # 注意：实际输出 token 数 = (T // tubelet_size) * n_spatial_tokens
         self.n_spatial_tokens = (vjepa_config.img_size // vjepa_config.patch_size) ** 2
         
-        # 对于 OpenP2P，我们需要返回每帧的 token 数
-        # 由于 V-JEPA 2 会压缩时间维度，我们需要根据实际输入帧数计算
-        # 但 get_n_img_tokens() 需要返回固定值，所以我们返回单帧（T=1）时的 token 数
-        # 注意：当 T=1 时，由于 tubelet_size=2，实际会复制成 T=2，所以输出 token 数 = n_spatial_tokens
-        self.n_img_tokens = self.n_spatial_tokens
+        # 对于 OpenP2P，我们需要返回每帧 token 数。
+        # 默认返回所有空间 tokens；可选开启全局聚合（每帧压成 1 token）以降低序列长度。
+        self.pool_to_global = bool(getattr(vjepa_config, "pool_to_global", False))
+        self.n_img_tokens = 1 if self.pool_to_global else self.n_spatial_tokens
         
         # 如果 V-JEPA 2 的输出维度与 embed_dim 不同，添加投影层
         vjepa_embed_dim = self.encoder.embed_dim
@@ -383,6 +833,20 @@ class Vjepa2Tokenizer(ImageBaseTokenizer):
             self.proj_to_embed_dim = nn.Linear(vjepa_embed_dim, embed_dim)
         else:
             self.proj_to_embed_dim = None
+
+        if self.pool_to_global:
+            hidden_dim = getattr(vjepa_config, "aggregation_mlp_hidden_dim", None)
+            if hidden_dim is None:
+                hidden_dim = embed_dim * 2
+            self.global_token_norm = LayerNormF32(embed_dim)
+            self.global_token_mlp = nn.Sequential(
+                nn.Linear(embed_dim, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, embed_dim),
+            )
+        else:
+            self.global_token_norm = None
+            self.global_token_mlp = None
         
         # 存储 vjepa_embed_dim 供 forward 使用
         self.vjepa_embed_dim = vjepa_embed_dim
@@ -665,9 +1129,17 @@ class Vjepa2Tokenizer(ImageBaseTokenizer):
             features = self.proj_to_embed_dim(features)
         
         # ========================================================================
-        # 步骤 7: 扩展时间维度回原始帧数
+        # 步骤 7: 可选空间聚合（patch tokens -> 全局 token）
         # ========================================================================
-        # 现在 features 是 [B, T_temporal, n_spatial_tokens, embed_dim]
+        if self.pool_to_global:
+            features = features.mean(dim=2, keepdim=True)
+            features = self.global_token_norm(features)
+            features = features + self.global_token_mlp(features)
+
+        # ========================================================================
+        # 步骤 8: 扩展时间维度回原始帧数
+        # ========================================================================
+        # 现在 features 是 [B, T_temporal, n_img_tokens, embed_dim]
         # 但 OpenP2P 期望的是 [B, T, n_img_tokens, embed_dim]，其中 T 是原始输入帧数
         # 由于 V-JEPA 2 压缩了时间维度（T_temporal = T_padded // tubelet_size），
         # 我们需要将时间维度扩展回原始帧数
@@ -715,10 +1187,10 @@ class Vjepa2Tokenizer(ImageBaseTokenizer):
         # ========================================================================
         # 验证输出形状
         # ========================================================================
-        # 确保输出形状符合预期：[B, original_T, n_spatial_tokens, embed_dim]
+        # 确保输出形状符合预期：[B, original_T, n_img_tokens, embed_dim]
         eager_assert(
             features_expanded.shape,
-            (B, original_T, self.n_spatial_tokens, self.embed_dim),
+            (B, original_T, self.n_img_tokens, self.embed_dim),
         )
         
         return features_expanded

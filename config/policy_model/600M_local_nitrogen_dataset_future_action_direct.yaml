@@ -1,5 +1,5 @@
 shared:
-  output_path: output/policy_model/150M_nitrogen_cuphead_future_action_direct_F18_2head
+  output_path: output/policy_model/600M_nitrogen_cuphead_future_action_direct_F18_2head
   n_seq_timesteps: 200
   frame_height: 192
   frame_width: 192
@@ -21,13 +21,13 @@ inference:
 
 # Policy Model Configuration
 policy_model:
-  n_transformer_layers: 10
+  n_transformer_layers: 20
   n_q_head: 16
   n_kv_head: 16
   n_thinking_tokens: 1
-  transformer_dim: &transformer_dim 1024
+  transformer_dim: &transformer_dim 1536
   mask_block_size: 128
-  attention_history_len: [200, 200, 200, 200, 200, 200, 200, 200, 200, 200]
+  attention_history_len: [200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200]
   n_kv_sink_tokens: 0
   model_type: "dense"
   # Single action_in token per step in the transformer sequence.
@@ -51,8 +51,8 @@ stage3_finetune:
 
   validation_step_interval: 999999
   n_validation_steps: &n_validation_steps 0
-  save_every_n_steps: 10000
-  n_training_steps: 300000
+  save_every_n_steps: 50000
+  n_training_steps: 500000
   accumulate_grad_batches: 1
 
   training_dataset:
@@ -92,4 +92,4 @@ wandb:
   enabled: True
   entity: "zjut-cv"
   project: "policy_model"
-  exp_name: "150M-nitrogen-cuphead-future-action-direct-F18-2head"
+  exp_name: "600M-nitrogen-cuphead-future-action-direct-F18-2head"
