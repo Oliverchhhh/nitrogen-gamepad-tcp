@@ -131,6 +131,8 @@ class NitrogenSiglipTokenizerConfig(ConfigBase):
     NitroGen 风格的 SigLIP 视觉编码器配置。
 
     不做 pooling，直接保留 dense visual tokens（例如 256 tokens/frame）。
+    可选将 256 tokens 压缩为 1 个全局 token（mean pooling + LayerNorm + Linear）。
+    支持从 NitroGen checkpoint（ng.pt）只加载 vision_encoder 权重。
     """
 
     # 视觉编码器名称（默认与 NitroGen 常用配置一致）
@@ -154,6 +156,18 @@ class NitrogenSiglipTokenizerConfig(ConfigBase):
 
     # 期望视觉隐藏维度（用于运行时一致性检查，None 表示不检查）
     vision_hidden_size: Optional[int] = None
+
+    # 是否将每帧 256 tokens 压缩为 1 个全局 token（mean pooling + LayerNorm + Linear）
+    # 开启后 get_n_img_tokens() 返回 1，显著降低 policy transformer 序列长度
+    pool_to_single_token: bool = False
+
+    # 从 NitroGen checkpoint（如 NitroGen_checkpoints/ng.pt）加载 vision_encoder 权重。
+    # 只加载 vision_encoder 部分，忽略 vl_self_attention_model 等其他权重。
+    # 若为 None 则不加载 checkpoint，使用 HuggingFace 预训练权重。
+    nitrogen_checkpoint_path: Optional[str] = None
+
+    # 加载 checkpoint 时是否严格匹配 key（建议 False，允许部分加载）
+    strict_load: bool = False
 
 
 class NitrogenCheckpointTokenizerConfig(ConfigBase):

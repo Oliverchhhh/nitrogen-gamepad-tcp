@@ -1,3 +1,4 @@
+import gc
 import logging
 import os
 from abc import abstractmethod
@@ -280,8 +281,9 @@ class StaMoTokenizer(ImageBaseTokenizer):
 class NitrogenSiglipTokenizer(ImageBaseTokenizer):
     """
     NitroGen 风格 SigLIP tokenizer：
-    - 保留 dense visual tokens（不做 pooling）
+    - 保留 dense visual tokens（不做 pooling），或压缩为单个全局 token
     - 若视觉维度与 policy embed_dim 不一致，自动线性投影
+    - 支持从 NitroGen checkpoint（ng.pt）只加载 vision_encoder 权重
     """
 
     def __init__(
@@ -325,16 +327,23 @@ class NitrogenSiglipTokenizer(ImageBaseTokenizer):
         self.use_image_processor_norm = siglip_cfg.use_image_processor_norm
 
         if "siglip" in siglip_cfg.vision_encoder_name.lower():
-            model = SiglipVisionModel.from_pretrained(
+            _full_model = SiglipVisionModel.from_pretrained(
                 self.model_source,
                 local_files_only=local_files_only,
             )
-            self.vision_encoder = model.vision_model
+            self.vision_encoder = _full_model.vision_model
+            # 释放 SiglipVisionModel 外壳，只保留 vision_model 子模块
+            del _full_model
+            gc.collect()
         else:
             self.vision_encoder = AutoModel.from_pretrained(
                 self.model_source,
                 local_files_only=local_files_only,
             )
+
+        # 从 NitroGen checkpoint 只加载 vision_encoder 权重（跳过 vl_self_attention_model）
+        if siglip_cfg.nitrogen_checkpoint_path is not None:
+            self._load_vision_encoder_from_checkpoint(siglip_cfg.nitrogen_checkpoint_path, siglip_cfg.strict_load)
 
         if siglip_cfg.frozen:
             self.vision_encoder.eval()
@@ -342,6 +351,7 @@ class NitrogenSiglipTokenizer(ImageBaseTokenizer):
                 param.requires_grad = False
 
         # 通过 dummy forward 确定 token 数和视觉维度，确保与主模型接口一致。
+        # 注意：此时 vision_encoder 还在 CPU 上，dummy forward 完成后立即清理激活残留。
         with torch.no_grad():
             dummy = torch.zeros(1, 3, self.target_img_size, self.target_img_size)
             dummy_out = self._encode_vision(dummy)
@@ -350,6 +360,8 @@ class NitrogenSiglipTokenizer(ImageBaseTokenizer):
                     f"NitrogenSiglipTokenizer expects 3D output [B, N, D], got shape {tuple(dummy_out.shape)}"
                 )
             _, n_tokens, vision_dim = dummy_out.shape
+            del dummy, dummy_out
+            gc.collect()
 
         if (
             siglip_cfg.expected_n_img_tokens is not None
@@ -368,10 +380,23 @@ class NitrogenSiglipTokenizer(ImageBaseTokenizer):
                 f"got {vision_dim}, expected {siglip_cfg.vision_hidden_size}"
             )
 
-        self.n_img_tokens = n_tokens
+        self.n_raw_tokens = n_tokens
         self.vision_hidden_size = vision_dim
 
-        if vision_dim != embed_dim:
+        # pool_to_single_token：mean pooling 将 N tokens → 1 token，再接 LayerNorm + Linear
+        self.pool_to_single_token = siglip_cfg.pool_to_single_token
+        if self.pool_to_single_token:
+            self.pool_norm = nn.LayerNorm(vision_dim)
+            self.pool_proj = nn.Linear(vision_dim, embed_dim)
+            self.n_img_tokens = 1
+            logging.info(
+                "NitrogenSiglipTokenizer: pool_to_single_token enabled, %d tokens -> 1 token",
+                n_tokens,
+            )
+        else:
+            self.n_img_tokens = n_tokens
+
+        if not self.pool_to_single_token and vision_dim != embed_dim:
             self.proj_to_embed_dim = nn.Linear(vision_dim, embed_dim)
             logging.info(
                 "NitrogenSiglipTokenizer: adding projection layer %s -> %s",
@@ -380,6 +405,49 @@ class NitrogenSiglipTokenizer(ImageBaseTokenizer):
             )
         else:
             self.proj_to_embed_dim = None
+
+    def _load_vision_encoder_from_checkpoint(self, checkpoint_path: str, strict: bool) -> None:
+        """从 NitroGen checkpoint（ng.pt）只加载 vision_encoder 权重，忽略其他模块。"""
+        ckpt_file = Path(checkpoint_path)
+        if not ckpt_file.exists():
+            raise ValueError(f"NitroGen checkpoint not found: {checkpoint_path}")
+
+        state_dict = torch.load(ckpt_file, map_location="cpu", weights_only=True)
+        # checkpoint 可能直接是 state_dict，也可能包含 "state_dict" / "model" key
+        if isinstance(state_dict, dict) and "state_dict" in state_dict:
+            state_dict = state_dict["state_dict"]
+        elif isinstance(state_dict, dict) and "model" in state_dict:
+            state_dict = state_dict["model"]
+
+        prefix = "vision_encoder."
+        vision_sd = {
+            k[len(prefix):]: v
+            for k, v in state_dict.items()
+            if k.startswith(prefix)
+        }
+        # 完整 checkpoint 已不再需要，立即释放以归还 /dev/shm 和 CPU 内存
+        del state_dict
+        gc.collect()
+
+        if not vision_sd:
+            raise ValueError(
+                f"No keys with prefix '{prefix}' found in checkpoint {checkpoint_path}. "
+                f"Available top-level keys: (state_dict already freed)"
+            )
+
+        missing, unexpected = self.vision_encoder.load_state_dict(vision_sd, strict=strict)
+        del vision_sd
+        gc.collect()
+
+        logging.info(
+            "NitrogenSiglipTokenizer: loaded vision_encoder from %s "
+            "(missing=%d, unexpected=%d, strict=%s)",
+            checkpoint_path, len(missing), len(unexpected), strict,
+        )
+        if missing:
+            logging.warning("NitrogenSiglipTokenizer: missing keys: %s", missing[:10])
+        if unexpected:
+            logging.warning("NitrogenSiglipTokenizer: unexpected keys: %s", unexpected[:10])
 
     def _encode_vision(self, x: torch.Tensor) -> torch.Tensor:
         outputs = self.vision_encoder(pixel_values=x)
@@ -422,11 +490,18 @@ class NitrogenSiglipTokenizer(ImageBaseTokenizer):
             features = self._encode_vision(x)
 
         eager_assert(features.shape[0], B * T)
-        eager_assert(features.shape[1], self.n_img_tokens)
+        eager_assert(features.shape[1], self.n_raw_tokens)
         eager_assert(features.shape[2], self.vision_hidden_size)
 
-        if self.proj_to_embed_dim is not None:
-            features = self.proj_to_embed_dim(features)
+        if self.pool_to_single_token:
+            # mean pooling: [B*T, N, D] -> [B*T, D] -> [B*T, 1, embed_dim]
+            features = features.mean(dim=1)
+            features = self.pool_norm(features)
+            features = self.pool_proj(features)
+            features = features.unsqueeze(1)
+        else:
+            if self.proj_to_embed_dim is not None:
+                features = self.proj_to_embed_dim(features)
 
         features = features.view(B, T, self.n_img_tokens, self.embed_dim)
         return features
