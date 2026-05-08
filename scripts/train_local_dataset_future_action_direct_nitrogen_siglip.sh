@@ -3,14 +3,17 @@
 
 set -e
 
-CONFIG_FILE="config/policy_model/150M_local_nitrogen_dataset_future_action_direct_nitrogen_siglip.yaml"
-# DATA_FOLDER="cuphead_dataset_converted/v350335326"
-DATA_FOLDER="cuphead_one_level_1"
-OUTPUT_DIR="output/policy_model/150M_nitrogen_cuphead_future_action_direct_siglip_F5_onelevel1"
+# CONFIG_FILE="config/policy_model/150M_local_nitrogen_dataset_future_action_direct_nitrogen_siglip.yaml"
+CONFIG_FILE="config/policy_model/150M_local_nitrogen_dataset_future_action_direct_nitrogen_siglip_1_token.yaml"
+DATA_FOLDER="cuphead_dataset_converted/v350335326"
+# DATA_FOLDER="cuphead_one_level_1"
+# OUTPUT_DIR="output/policy_model/150M_nitrogen_cuphead_future_action_direct_siglip_F5_onelevel1"
+OUTPUT_DIR="output/policy_model/150M_nitrogen_cuphead_future_action_direct_nitrogen_siglip_1token_F18_zero_action_v350335326"
 RESUME_CKPT=""
 VISION_ENCODER_NAME=""
 VISION_ENCODER_LOCAL_PATH=""
-WANDB_EXP_NAME="150M_nitrogen_cuphead_future_action_direct_siglip_F5_onelevel1"
+# WANDB_EXP_NAME="150M_nitrogen_cuphead_future_action_direct_siglip_F5_onelevel1"
+WANDB_EXP_NAME="150M-nitrogen-cuphead-future-action-direct-nitrogen-siglip-1token-F18-zero-action-v350335326"
 GPUS="3"
 TEMP_CONFIG_FILE=""
 
