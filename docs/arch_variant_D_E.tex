@@ -1,0 +1,315 @@
+% =================================================================
+% Architecture Diagram: Direct Multi-Frame Action + Zero Action History
+% Variant D+E: future_action_direct_F18_2head_zero_action
+%
+% Compile:
+%   pdflatex arch_variant_D_E.tex
+%   (requires: tikz, amsmath, xcolor)
+% =================================================================
+
+\documentclass[tikz, border=16pt]{standalone}
+\usepackage{tikz}
+\usepackage{amsmath}
+\usetikzlibrary{
+  arrows.meta,
+  positioning,
+  calc,
+  decorations.pathreplacing,
+  backgrounds,
+  fit
+}
+
+% ──── colour palette (Tailwind-inspired) ─────────────────────────
+\definecolor{CBlue}   {HTML}{DBEAFE}   % blue-100   – frame input
+\definecolor{CViolet} {HTML}{EDE9FE}   % violet-100 – text
+\definecolor{CAmber}  {HTML}{FEF3C7}   % amber-100  – image tokenizer
+\definecolor{CGreen}  {HTML}{D1FAE5}   % emerald-100 – thinking / a0
+\definecolor{CAOGreen}{HTML}{A7F3D0}   % emerald-200 – a0 token (brighter)
+\definecolor{CRed}    {HTML}{FEE2E2}   % red-100    – a_in (zero)
+\definecolor{CGray}   {HTML}{F1F5F9}   % slate-50   – transformer bg
+\definecolor{CYellow} {HTML}{FEFCE8}   % yellow-50  – MLP
+\definecolor{CEmer}   {HTML}{ECFDF5}   % green-50   – button head
+\definecolor{CSky}    {HTML}{E0F2FE}   % sky-100    – stick head
+\definecolor{Ink}     {HTML}{1E293B}   % slate-800  – text & borders
+\definecolor{RedAnn}  {HTML}{FEF2F2}   % red-50     – annotation bg
+
+\begin{document}
+\begin{tikzpicture}[
+  % ── global ──────────────────────────────────────────────────────
+  >=Stealth,
+  every node/.style={font=\small\sffamily, text=Ink},
+  % ── box: filled rounded rectangle ───────────────────────────────
+  % usage: \node[mbox=<fill>] ...
+  mbox/.style={
+    rectangle, rounded corners=5pt,
+    draw=Ink!55, line width=1.0pt,
+    fill=#1, align=center, inner sep=8pt
+  },
+  mbox/.default=CGray,
+  % ── token box inside the sequence strip ─────────────────────────
+  tbox/.style={
+    rectangle,
+    draw=Ink!45, line width=0.9pt,
+    fill=#1, align=center, inner sep=3pt,
+    minimum width=1.05cm, minimum height=1.0cm,
+    font=\footnotesize\sffamily
+  },
+  tbox/.default=CGray,
+  % ── arrows ──────────────────────────────────────────────────────
+  arr/.style  ={->, line width=1.2pt, draw=Ink!65},
+  rarr/.style ={->, line width=0.9pt, draw=red!60,  dashed},
+  % ── labels ──────────────────────────────────────────────────────
+  shp/.style={font=\tiny\sffamily, text=Ink!50, align=center},
+  % ── annotation box ──────────────────────────────────────────────
+  ann/.style={
+    rectangle, rounded corners=4pt,
+    draw=red!45, line width=0.9pt,
+    fill=RedAnn, align=center,
+    font=\scriptsize\sffamily, inner sep=7pt
+  },
+]
+
+% =================================================================
+% SECTION 1 – INPUTS
+% =================================================================
+\node[mbox=CBlue, minimum width=3.0cm, minimum height=1.8cm]
+  (inpF) at (0, 6.2) {
+  \textbf{Video Frame}\\[4pt]
+  $B\!\times\!T\!\times\!3\!\times\!192\!\times\!192$\\[1pt]
+  \texttt{uint8}
+};
+\node[mbox=CViolet, minimum width=3.0cm, minimum height=1.8cm]
+  (inpT) at (0, 2.8) {
+  \textbf{Text Instruction}\\[4pt]
+  (optional, string)\\[1pt]
+  {\scriptsize 允许全零 $\to$ 学习占位}
+};
+
+% =================================================================
+% SECTION 2 – ENCODERS
+% =================================================================
+\node[mbox=CAmber, minimum width=3.4cm, minimum height=2.5cm]
+  (encI) at (5.2, 6.2) {
+  \textbf{Image Tokenizer}\\[5pt]
+  \textsf{ConvTokenizer}\\
+  {\scriptsize EfficientNet-B0 + MLP}\\[5pt]
+  $\rightarrow (B,\,T,\,n_{img},\,D)$\\[1pt]
+  {\scriptsize\color{Ink!50} $n_{img}=1,\ D=1024$}
+};
+
+\node[mbox=CViolet, minimum width=3.4cm, minimum height=2.5cm]
+  (encT) at (5.2, 2.8) {
+  \textbf{Text Tokenizer}\\[5pt]
+  \textsf{GemmaEmbed-300M}\\[3pt]
+  $\rightarrow(B,T,1,768)$\\
+  $\xrightarrow{\;\mathrm{MLP}\;} (B,T,1,D)$\\[1pt]
+  {\scriptsize\color{Ink!50} 投影到 $D=1024$}
+};
+
+\draw[arr] (inpF) -- (encI);
+\draw[arr] (inpT) -- (encT);
+
+% =================================================================
+% SECTION 3 – PER-STEP TOKEN SEQUENCE
+% =================================================================
+
+% background
+\node[draw=Ink!20, fill=CGray, rounded corners=7pt, line width=1pt,
+      minimum width=5.6cm, minimum height=6.2cm]
+  (seqBg) at (10.5, 4.5) {};
+
+% header
+\node[font=\scriptsize\sffamily\bfseries, text=Ink!50,
+      anchor=north west]
+  at ($(seqBg.north west)+(0.18,-0.14)$)
+  {Per-Step Token Layout\;($\times T$ steps, causal)};
+
+% ── token strip ──────────────────────────────────────────────────
+\node[tbox=CViolet, minimum width=0.90cm] (tt) at (8.95, 5.45) {
+  \textbf{txt}\\[-1pt]{\tiny$(1)$}
+};
+\node[tbox=CAmber,  minimum width=1.05cm, right=0.10cm of tt] (ti) {
+  \textbf{img}\\[-1pt]{\tiny$(n_{img})$}
+};
+\node[tbox=CGreen,  minimum width=0.90cm, right=0.10cm of ti] (tk) {
+  \textbf{thk}\\[-1pt]{\tiny$(1)$}
+};
+\node[tbox=CAOGreen, minimum width=0.90cm, right=0.10cm of tk] (tao) {
+  $\boldsymbol{a^{\!0}}$\\[-1pt]{\tiny$(1)$}
+};
+% a_in: zero input — highlighted in red
+\node[tbox=CRed,    minimum width=0.95cm, right=0.10cm of tao] (tain) {
+  $\boldsymbol{a_{in}}$\\[-1pt]{\tiny$(1)$}\\[-2pt]{\tiny$\equiv\!\mathbf{0}$}
+};
+
+% ── causal mask description ───────────────────────────────────────
+\node[font=\scriptsize\sffamily, text=Ink!65,
+      align=center, text width=4.8cm]
+  at ($(seqBg.center)+(0,-0.65)$) {
+  \textit{Causal mask rules:}\\[4pt]
+  img/txt/thk\;\;can see\;\;previous steps\\[1pt]
+  $a^0$\;\;sees img/txt/thk (current step only)\\[1pt]
+  $a^0$\;\textbf{cannot}\;be attended to as KV\\[1pt]
+  $a_{in}=\mathbf{0}$\;\;carries position info only
+};
+
+% ── arrows: encoders → token strip ───────────────────────────────
+\draw[arr] (encI.east) to[out=0, in=140] (ti.north west);
+\draw[arr] (encT.east) to[out=0, in=220] (tt.south west);
+
+% ── zero_action annotation (below seqBg) ─────────────────────────
+\node[ann, below=1.0cm of seqBg.south] (zann) {
+  \textbf{zero\_action\_input = True}\\[5pt]
+  训练：$a_{in}\!\leftarrow$ pos\,tokens only（无 GT 动作嵌入）\\[2pt]
+  推理：$a_{in}=\mathbf{0}$，\textbf{跳过 Pass\,2}（单次 forward）\\[4pt]
+  $\Longrightarrow$\;消除 teacher-forcing\,/\,AR 推理分布差异
+};
+\draw[rarr] (zann.north) to[out=90, in=260] (tain.south);
+
+% =================================================================
+% SECTION 4 – POLICY CAUSAL TRANSFORMER
+% =================================================================
+\node[mbox=CGray, minimum width=3.2cm, minimum height=6.2cm]
+  (tfm) at (15.2, 4.5) {
+  \textbf{Policy Causal}\\
+  \textbf{Transformer}\\[10pt]
+  $\bullet$\;10 layers\\[2pt]
+  $\bullet$\;$d\!=\!1024$\\[2pt]
+  $\bullet$\;16 heads (MHA)\\[2pt]
+  $\bullet$\;RoPE\\[2pt]
+  $\bullet$\;FlexAttention\\
+  \phantom{bb}block\,mask\\[14pt]
+  {\footnotesize\color{red!65}
+    \texttt{skip\_action}\\[-2pt]
+    \texttt{\_decoder=True}\\[-1pt]
+    \textit{(无 ActionDecoder)}}
+};
+
+\draw[arr] (seqBg.east) -- (tfm.west)
+  node[midway, above, shp] {$(B,\;T\!\cdot\!\mathrm{L},\;D)$};
+
+% =================================================================
+% SECTION 5a – PICK a⁰ OUTPUT
+% =================================================================
+\node[mbox=CGreen, minimum width=3.0cm]
+  (aopick) at (19.3, 7.1) {
+  \textbf{取\;$a^0$ 输出位}\\[5pt]
+  每步偏移 $n_{img}+1+1$\\[3pt]
+  $\rightarrow (B,\;T,\;D)$
+};
+
+\draw[arr] (tfm.east) -- (aopick.west)
+  node[midway, above, shp] {full output};
+
+% =================================================================
+% SECTION 5b – direct\_action\_mlp
+% =================================================================
+\node[mbox=CYellow, minimum width=3.0cm, below=0.65cm of aopick]
+  (mlp) {
+  \textbf{direct\_action\_mlp}\\[6pt]
+  \textsf{Linear}$(1024\!\to\!512)$\;+\;\textsf{SiLU}\\[2pt]
+  \textsf{Linear}$(512\!\to\!256)$\;+\;\textsf{SiLU}\\[6pt]
+  $\rightarrow (B,\;T,\;256)$
+};
+
+\draw[arr] (aopick) -- (mlp);
+
+% =================================================================
+% SECTION 6 – 2 PARALLEL HEADS
+% =================================================================
+
+% ── Button Head ──────────────────────────────────────────────────
+\node[mbox=CEmer, minimum width=4.0cm]
+  (btnH) at (23.8, 7.1) {
+  \textbf{direct\_button\_head}\\[5pt]
+  \textsf{Linear}$(256\!\to\!18\!\times\!12\!=\!216)$\\[2pt]
+  reshape\;$\to(B,T,\mathbf{18},12)$\\[6pt]
+  Loss:\;\textbf{BCEWithLogitsLoss}\\[1pt]
+  {\scriptsize 12 个 Cuphead 按钮，多标签独立}\\[5pt]
+  推理：$\sigma(\cdot)\!>\!0.5$，取\;$f\!=\!0$ 帧
+};
+
+% ── Stick Head ────────────────────────────────────────────────────
+\node[mbox=CSky, minimum width=4.0cm]
+  (stkH) at (23.8, 3.3) {
+  \textbf{direct\_stick\_head}\\[5pt]
+  \textsf{Linear}$(256\!\to\!18\!\times\!4\!\times\!3\!=\!216)$\\[2pt]
+  reshape\;$\to(B,T,\mathbf{18},4,3)$\;+ split\\[6pt]
+  Loss:\;$4\!\times$\textbf{CrossEntropy}\\[1pt]
+  {\scriptsize LX / LY / RX / RY，各 $S\!=\!3$ bins}\\[5pt]
+  推理：$\mathrm{argmax}$，取\;$f\!=\!0$ 帧
+};
+
+\draw[arr] (mlp.east) to[out=0, in=180] (btnH.west);
+\draw[arr] (mlp.east) to[out=0, in=180] (stkH.west);
+
+% ── "2-HEAD" brace & label ────────────────────────────────────────
+\draw[decorate,
+      decoration={brace, amplitude=7pt, mirror},
+      line width=1.0pt, Ink!35]
+  ($(btnH.south west)+(-0.35, 0)$) -- ($(stkH.north west)+(-0.35, 0)$)
+  node[midway, left=0.55cm,
+       font=\scriptsize\sffamily\bfseries, text=Ink!50,
+       align=center] {2\\HEAD};
+
+% =================================================================
+% OUTPUT SHAPE LABELS (right of heads)
+% =================================================================
+\node[shp, right=0.45cm of btnH.east, text width=3.2cm] {
+  \textbf{buttons:}\\
+  $(B,\;T,\;F{=}18,\;n_b{=}12)$\\[3pt]
+  {\tiny $F=18$ future frames predicted}
+};
+\node[shp, right=0.45cm of stkH.east, text width=3.2cm] {
+  \textbf{LX, LY, RX, RY:}\\
+  each\;$(B,\;T,\;F{=}18,\;S{=}3)$\\[3pt]
+  {\tiny 3 bins: left\,/\,neutral\,/\,right}
+};
+
+% =================================================================
+% INFERENCE / TRAINING NOTE
+% =================================================================
+\node[ann, below=0.9cm of stkH.south, xshift=-0.3cm] (infNote) {
+  \textbf{训练：}对\;$f=0,\,1,\,\ldots,\,17$\;全部帧计算损失，加权平均\\[5pt]
+  \textbf{推理：仅取\;$f=0$\;帧}\\[3pt]
+  $\hat{b}\;=\;\sigma\!\bigl(\mathrm{buttons}[\cdots,\,f{=}0,\,:\,]\bigr)>0.5$\qquad
+  （12 个按钮，多标签）\\[2pt]
+  $\hat{s}\;=\;\mathrm{argmax}\!\bigl(\mathrm{stick}[\cdots,\,f{=}0,\,:\,],\;\dim=-1\bigr)$\quad
+  （LX/LY/RX/RY）
+};
+\draw[rarr] (btnH.south) to[out=270, in=90] (infNote.north);
+
+% =================================================================
+% TITLE
+% =================================================================
+\node[font=\large\sffamily\bfseries, text=Ink, align=center]
+  at (12.8, 11.0) {
+  Direct Multi-Frame Action Prediction + Zero Action History
+};
+\node[font=\normalsize\sffamily, text=Ink!55, align=center]
+  at (12.8, 10.35) {
+  \texttt{future\_action\_direct\_F18\_2head\_zero\_action}\;（Variant D\,+\,E）
+};
+
+% =================================================================
+% LEGEND  (bottom-left)
+% =================================================================
+\begin{scope}[shift={(0,-4.5)}]
+  \node[font=\scriptsize\sffamily\bfseries, text=Ink!60, anchor=west]
+    at (0, 0) {Legend:};
+  \node[tbox=CViolet, minimum width=0.7cm, minimum height=0.5cm, inner sep=2pt,
+        font=\tiny\sffamily] (leg1) at (1.4, 0) {txt};
+  \node[font=\tiny\sffamily, right=0.1cm of leg1] {Text token};
+  \node[tbox=CAmber,  minimum width=0.7cm, minimum height=0.5cm, inner sep=2pt,
+        font=\tiny\sffamily, right=2.0cm of leg1] (leg2) {img};
+  \node[font=\tiny\sffamily, right=0.1cm of leg2] {Image token};
+  \node[tbox=CAOGreen,minimum width=0.7cm, minimum height=0.5cm, inner sep=2pt,
+        font=\tiny\sffamily, right=4.0cm of leg1] (leg3) {$a^0$};
+  \node[font=\tiny\sffamily, right=0.1cm of leg3] {Action-out (output slot)};
+  \node[tbox=CRed,    minimum width=0.7cm, minimum height=0.5cm, inner sep=2pt,
+        font=\tiny\sffamily, right=7.0cm of leg1] (leg4) {$a_{in}$};
+  \node[font=\tiny\sffamily, right=0.1cm of leg4] {$\equiv\mathbf{0}$ (zero\_action\_input)};
+\end{scope}
+
+\end{tikzpicture}
+\end{document}
