@@ -1,0 +1,110 @@
+shared:
+  output_path: output/policy_model/150M_stamo_cotrain_N10
+  # Per-step layout: text(1)+img(1)+think(1)+s0(10)+a0(1)+action_in(1) = 15 tokens
+  # Total seq: 200 * 15 = 3000 tokens
+  n_seq_timesteps: 200
+  frame_height: 256
+  frame_width: 256
+  action_mapping_type: "gamepad_direct"
+  gamepad_direct_action_mapping:
+    n_stick_bins: 3
+    stick_deadzone: 0.15
+  text_tokenizer_config:
+    text_tokenizer_name: "gemma"
+    text_embedding_shape: [1, 768]
+    text_annotation_model_version: ["gemini-2.5-flash", "gemini-2.5-flash-thinking-0905"]
+  tokenizer:
+    type: "nitrogen_siglip"
+    nitrogen_siglip_tokenizer_config:
+      vision_encoder_name: "google/siglip2-large-patch16-256"
+      vision_encoder_local_path: "./checkpoints/siglip2-large-patch16-256"
+      image_size: 256
+      frozen: true
+      use_image_processor_norm: true
+      expected_n_img_tokens: 256
+      vision_hidden_size: 1024
+      pool_to_single_token: true
+      nitrogen_checkpoint_path: "NitroGen_checkpoints/ng.pt"
+      strict_load: false
+
+inference:
+  mouse_sampling_approach: "truncated_normal"
+
+policy_model:
+  n_transformer_layers: 10
+  n_q_head: 16
+  n_kv_head: 16
+  n_thinking_tokens: 1
+  transformer_dim: &transformer_dim 1024
+  mask_block_size: 128
+  attention_history_len: [200, 200, 200, 200, 200, 200, 200, 200, 200, 200]
+  n_kv_sink_tokens: 0
+  model_type: "dense"
+  n_future_action_tokens: 1
+  # 18-frame action prediction from single a0 token
+  n_future_frames: 18
+  zero_action_input: true
+  action_decoder:
+    embed_dim: *transformer_dim
+  # N=10 StaMo state tokens per step
+  # s0_k predicts StaMo representation of frame t+k+1 (k=0..9)
+  n_future_state_tokens: 10
+
+stage3_finetune:
+  optim:
+    learning_rate: 0.0001
+    weight_decay: 0.0001
+    beta_1: 0.9
+    beta_2: 0.999
+
+  validation_step_interval: 999999
+  n_validation_steps: &n_validation_steps 0
+  save_every_n_steps: 30000
+  n_training_steps: 300000
+  accumulate_grad_batches: 1
+
+  # StaMo co-training configuration
+  future_vision_loss_weight: 0.1
+  # Path to StaMo checkpoint directory (contains RenderNet.pth and Projector.pth)
+  # Replace with the actual path when the checkpoint is available on the server
+  stamo_checkpoint_dir: "PLACEHOLDER_StaMo_checkpoint_dir"
+  use_precomputed_stamo_features: false
+  # Optional: path to a pre-trained BC policy checkpoint to warm-start the policy
+  # Set to null to train from scratch
+  bc_checkpoint_path: null
+
+  training_dataset:
+    batch_size: &stage3_batch_size 1
+    local_prefix: "cuphead_dataset_converted"
+    load_video_name: "256x256.mp4"
+    warn_on_starvation: false
+    always_labelled: true
+    rand_augmentation:
+      fraction_augmented: 1.0
+      augmentations:
+        - "color"
+        - "planckian"
+        - "iso_noise"
+        - "random_blur"
+    n_preprocess_threads_per_gpu: 2
+    preprocessed_chunks_queue_size_per_gpu: 8
+    shuffled_chunks_queue_size_per_gpu: 4
+    dataset_worker_prefetch_factor: 2
+
+  validation_datasets:
+    - validation_name: "default_validation"
+      batch_size: *stage3_batch_size
+      local_prefix: "cuphead_dataset_converted"
+      load_video_name: "256x256.mp4"
+      n_preprocess_threads_per_gpu: 8
+      preprocessed_chunks_queue_size_per_gpu: 1
+      shuffled_chunks_queue_size_per_gpu: 1
+      dataset_worker_prefetch_factor: 8
+      warn_on_starvation: false
+      always_labelled: true
+
+wandb:
+  enabled: True
+  entity: "zjut-cv"
+  project: "policy_model"
+  exp_name: "150M-stamo-cotrain-N10-F18"

@@ -2885,3 +2885,499 @@ def train_stage3_future_vision(config: LightningPolicyConfig):
     wandb_logger.experiment.finish()
     return async_checkpointer.get_final_checkpoint()
 
+
+# ---------------------------------------------------------------------------
+# StaMo co-training
+# ---------------------------------------------------------------------------
+
+class Stage3StaMoFutureVisionLightning(PolicyModelTrainer):
+    """
+    Stage-3 training with N-step StaMo future state representation prediction.
+
+    Each step in the transformer sequence contains N learnable s0 tokens. s0_k
+    predicts the StaMo representation of frame t+k+1 via a Linear(1024→8192) head.
+    a0 can attend all N s0 tokens at the same step during training.
+
+    Loss = action_loss + future_vision_loss_weight × stamo_mse_loss
+    """
+
+    _EXCLUDED_CKPT_PREFIX = "stamo_encoder"
+
+    def __init__(
+        self,
+        config: LightningPolicyConfig,
+        inference_mode: bool = False,
+    ):
+        super().__init__(
+            config,
+            stage_name="stage3_stamo_future_vision",
+            inference_mode=inference_mode,
+        )
+
+        self.future_vision_loss_weight = config.stage3_finetune.future_vision_loss_weight
+        N = config.policy_model.n_future_state_tokens
+        if N < 1:
+            raise ValueError(
+                "policy_model.n_future_state_tokens must be >= 1 for StaMo co-training"
+            )
+        self.n_future_state_tokens = N
+
+        from elefant.policy_model.policy_transformer import (
+            PolicyStaMoFutureCausalTransformer,
+            PolicyCausalTransformerConfig,
+        )
+        from elefant.policy_model.action_decoder import ActionDecoderConfig
+
+        self.bc_transformer = PolicyStaMoFutureCausalTransformer(
+            config=PolicyCausalTransformerConfig(
+                embed_dim=config.policy_model.transformer_dim,
+                n_steps=config.shared.n_seq_timesteps,
+                n_transformer_layers=config.policy_model.n_transformer_layers,
+                n_q_head=config.policy_model.n_q_head,
+                n_kv_head=config.policy_model.n_kv_head,
+                mask_block_size=config.policy_model.mask_block_size or 128,
+                n_thinking_tokens=config.policy_model.n_thinking_tokens,
+                attention_history_len=config.policy_model.attention_history_len,
+                model_type=config.policy_model.model_type,
+                action_decoder=ActionDecoderConfig(
+                    embed_dim=config.policy_model.action_decoder.embed_dim,
+                    n_action_tokens=self.action_mapping.get_seq_len() + 1,
+                    input_action_token_dim=config.policy_model.transformer_dim,
+                ),
+                n_kv_sink_tokens=config.policy_model.n_kv_sink_tokens,
+                n_action_tokens=self.transformer_n_action_tokens,
+                text_token_size=self.text_token_size,
+                text_tokenizer_embed_dim=self.text_tokenizer_embed_dim,
+                zero_action_input=config.policy_model.zero_action_input,
+                n_future_frames=config.policy_model.n_future_frames,
+            ),
+            image_tokenizer=self.image_tokenizer,
+            inference_mode=self.inference_mode,
+            future_vision_loss_weight=self.future_vision_loss_weight,
+            n_future_state_tokens=N,
+        )
+
+        # Optionally warm-start from a BC checkpoint (strict=False for new params)
+        bc_ckpt = config.stage3_finetune.bc_checkpoint_path
+        if bc_ckpt is not None:
+            if os.path.exists(bc_ckpt):
+                logging.info("Loading BC checkpoint for StaMo co-training: %s", bc_ckpt)
+                ckpt = torch.load(bc_ckpt, map_location="cpu")
+                state_dict = ckpt.get("state_dict", ckpt)
+                # Remove Lightning module prefix so keys match bc_transformer directly
+                state_dict = {
+                    (k[len("bc_transformer."):] if k.startswith("bc_transformer.") else k): v
+                    for k, v in state_dict.items()
+                }
+                missing, unexpected = self.bc_transformer.load_state_dict(
+                    state_dict, strict=False
+                )
+                logging.info(
+                    "BC checkpoint loaded. Missing: %d, Unexpected: %d",
+                    len(missing), len(unexpected),
+                )
+                if missing:
+                    logging.info("Missing keys (first 10): %s", missing[:10])
+            else:
+                logging.warning(
+                    "bc_checkpoint_path not found: %s — starting from scratch.", bc_ckpt
+                )
+
+        # StaMo encoder for online supervision target computation
+        self.stamo_encoder: Optional[nn.Module] = None
+        if not config.stage3_finetune.use_precomputed_stamo_features:
+            from elefant.policy_model.stamo_encoder import StaMoEncoder
+            stamo_ckpt_dir = config.stage3_finetune.stamo_checkpoint_dir
+            self.stamo_encoder = StaMoEncoder(checkpoint_dir=stamo_ckpt_dir)
+            logging.info("StaMo encoder loaded. Checkpoint dir: %s", stamo_ckpt_dir)
+        else:
+            logging.info("StaMo co-training: using precomputed stamo_features.pt per chunk.")
+
+        if config.policy_model.model_type == "sparse_moe":
+            self.compile_mode = torch.compile()
+        else:
+            self.compile_mode = torch.compile(mode="max-autotune")
+
+        self.transformer_forward_function = self.bc_transformer.forward
+
+    def _build_stamo_targets(
+        self,
+        frames: torch.Tensor,
+        future_vision_pred: torch.Tensor,
+        precomputed_stamo_features: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Build StaMo supervision targets: [B, T, N, 8192].
+
+        s0_k at step t targets stamo_encode(frame[t+k+1]).flatten().
+        If t+k+1 >= T the target is zeros.
+
+        frames: [B, T, 3, H, W], already normalized.
+        precomputed_stamo_features: optional [B, T, 8192] pre-encoded targets.
+        """
+        B, T = future_vision_pred.shape[:2]
+        N = self.n_future_state_tokens
+        FLAT_DIM = 8192  # 2 × 4096
+        dtype = future_vision_pred.dtype
+        device = future_vision_pred.device
+
+        if precomputed_stamo_features is not None:
+            all_feats = precomputed_stamo_features.to(dtype=dtype, device=device)
+        else:
+            with torch.no_grad():
+                frames_flat = frames.reshape(B * T, *frames.shape[2:])
+                embeds = self.stamo_encoder.encode(frames_flat)   # [B*T, 2, 4096]
+                all_feats = embeds.reshape(B, T, FLAT_DIM).detach()
+
+        # Pad with zeros so that index t+k+1 is safe for all k in [0, N)
+        padded = torch.zeros(B, T + N, FLAT_DIM, dtype=dtype, device=device)
+        padded[:, :T, :] = all_feats
+
+        targets = torch.stack(
+            [padded[:, k + 1 : k + 1 + T, :] for k in range(N)],
+            dim=2,
+        )  # [B, T, N, 8192]
+        return targets.detach()
+
+    def on_save_checkpoint(self, checkpoint: dict) -> None:
+        keys_to_remove = [
+            k for k in checkpoint["state_dict"]
+            if k.startswith(self._EXCLUDED_CKPT_PREFIX)
+        ]
+        for k in keys_to_remove:
+            del checkpoint["state_dict"][k]
+        if keys_to_remove:
+            logging.info(
+                "on_save_checkpoint: removed %d stamo_encoder keys.", len(keys_to_remove)
+            )
+
+    def on_load_checkpoint(self, checkpoint: dict) -> None:
+        if self.stamo_encoder is None:
+            return
+        current_sd = self.state_dict()
+        missing = [
+            k for k in current_sd
+            if k.startswith(self._EXCLUDED_CKPT_PREFIX)
+            and k not in checkpoint["state_dict"]
+        ]
+        for k in missing:
+            checkpoint["state_dict"][k] = current_sd[k]
+
+    def configure_optimizers(self):
+        assert not self.inference_mode
+        optimizer = torch.optim.AdamW(
+            self.parameters(),
+            lr=self.config.stage3_finetune.optim.learning_rate,
+            betas=(
+                self.config.stage3_finetune.optim.beta_1,
+                self.config.stage3_finetune.optim.beta_2,
+            ),
+            weight_decay=self.config.stage3_finetune.optim.weight_decay,
+            fused=True,
+        )
+        return [optimizer]
+
+    def training_step(self, batch, batch_idx):
+        if self.trainer.global_step == 0:
+            logging.info(
+                "First StaMo co-training step (compilation may take a while). "
+                "rank=%d, n_future_state_tokens=%d",
+                self.trainer.global_rank,
+                self.n_future_state_tokens,
+            )
+
+        batch = self._apply_augmentations(batch)
+        text_tokens_embed = batch.text_embeddings
+
+        with torch.no_grad():
+            actions_in, masked_labels, ratio_unlabeled = (
+                self._create_target_and_masked_labels(batch)
+            )
+
+        @self.compile_mode
+        def _compiled_forward(batch, actions_in, text_tokens_embed):
+            frames = self._normalize_frames(batch.frames)
+            action_embeddings_in = self.action_in_to_tokens(actions_in)
+            action_out_embeddings, _, future_vision_pred, auxiliary_losses, auxiliary_outputs = (
+                self.transformer_forward_function(
+                    frames,
+                    action_embeddings_in,
+                    text_tokens_embed,
+                    skip_action_decoder=self._use_gamepad_direct_mapping(),
+                )
+            )
+            return action_out_embeddings, future_vision_pred, auxiliary_losses, auxiliary_outputs, frames
+
+        action_out_embeddings, future_vision_pred, auxiliary_losses, auxiliary_outputs, frames = (
+            _compiled_forward(batch, actions_in, text_tokens_embed)
+        )
+
+        precomputed_feats = getattr(batch, "precomputed_stamo_features", None)
+        stamo_targets = self._build_stamo_targets(
+            frames=frames,
+            future_vision_pred=future_vision_pred,
+            precomputed_stamo_features=precomputed_feats,
+        )
+        future_vision_loss = F.mse_loss(future_vision_pred, stamo_targets)
+
+        if self._use_gamepad_direct_mapping():
+            a_in_0 = action_out_embeddings[:, :, 0, :]
+            action_logits_all = self.action_out_tokens_to_logits(a_in_0)
+            F_dec = self.n_direct_future_frames
+            total_action_loss = None
+            total_losses: dict = {}
+            for i in range(F_dec):
+                labels_i = self._build_future_masked_labels(masked_labels, i)
+                action_logits_i = GamepadDirectActionLogits(
+                    buttons=action_logits_all.buttons[:, :, i, :],
+                    left_stick_x=action_logits_all.left_stick_x[:, :, i, :],
+                    left_stick_y=action_logits_all.left_stick_y[:, :, i, :],
+                    right_stick_x=action_logits_all.right_stick_x[:, :, i, :],
+                    right_stick_y=action_logits_all.right_stick_y[:, :, i, :],
+                )
+                aux = auxiliary_losses if i == 0 else {}
+                loss_i, _, losses_i = self._calculate_action_losses_from_logits_eager(
+                    action_logits=action_logits_i,
+                    masked_labels=labels_i,
+                    auxiliary_losses=aux,
+                    batch_size=action_out_embeddings.shape[0],
+                    T=action_out_embeddings.shape[1],
+                )
+                if total_action_loss is None:
+                    total_action_loss = loss_i
+                    total_losses = dict(losses_i)
+                else:
+                    total_action_loss = total_action_loss + loss_i
+                    for k, v in losses_i.items():
+                        total_losses[k] = total_losses.get(k, 0) + v
+            action_loss = total_action_loss / F_dec
+            losses = {k: v / F_dec for k, v in total_losses.items()}
+        else:
+            action_logits = self.action_out_tokens_to_logits(action_out_embeddings)
+            action_loss, losses = self._calculate_action_loss_from_logits(
+                action_logits, masked_labels, auxiliary_losses
+            )
+
+        total_loss = action_loss + self.future_vision_loss_weight * future_vision_loss
+        auxiliary_outputs["ratio_unlabeled"] = ratio_unlabeled
+
+        if self.trainer.global_step % 50 == 0:
+            self.log("train/loss_action", action_loss, on_step=True, on_epoch=True, sync_dist=True)
+            self.log("train/loss_stamo", future_vision_loss, on_step=True, on_epoch=True, sync_dist=True)
+            self.log("train/loss_total", total_loss, on_step=True, on_epoch=True, sync_dist=True)
+            self.log(
+                "training_ratio_unlabeled",
+                auxiliary_outputs["ratio_unlabeled"],
+                on_step=True,
+                sync_dist=True,
+            )
+            for loss_name, loss_value in losses.items():
+                self.log(
+                    f"train/loss_{loss_name}",
+                    loss_value,
+                    on_step=True,
+                    on_epoch=True,
+                    sync_dist=True,
+                )
+
+        return total_loss
+
+    def validation_step(self, batch, batch_idx, dataloader_idx=0):
+        text_tokens_embed = batch.text_embeddings
+        actions_in, masked_labels, _ = self._create_target_and_masked_labels(batch)
+
+        @self.compile_mode
+        def _compiled_val(batch, text_tokens_embed):
+            frames = self._normalize_frames(batch.frames)
+            action_embeddings_in = self.action_in_to_tokens(actions_in)
+            action_out_embeddings, _, future_vision_pred, auxiliary_losses, auxiliary_outputs = (
+                self.transformer_forward_function(
+                    frames, action_embeddings_in, text_tokens_embed,
+                    skip_action_decoder=self._use_gamepad_direct_mapping(),
+                )
+            )
+            return action_out_embeddings, future_vision_pred, auxiliary_losses, auxiliary_outputs, frames
+
+        action_out_embeddings, future_vision_pred, auxiliary_losses, auxiliary_outputs, frames = (
+            _compiled_val(batch, text_tokens_embed)
+        )
+
+        precomputed_feats = getattr(batch, "precomputed_stamo_features", None)
+        stamo_targets = self._build_stamo_targets(
+            frames=frames,
+            future_vision_pred=future_vision_pred,
+            precomputed_stamo_features=precomputed_feats,
+        )
+        future_vision_loss = F.mse_loss(future_vision_pred, stamo_targets)
+
+        if self._use_gamepad_direct_mapping():
+            a_in_0 = action_out_embeddings[:, :, 0, :]
+            action_logits_all = self.action_out_tokens_to_logits(a_in_0)
+            F_dec = self.n_direct_future_frames
+            total_action_loss = None
+            total_losses: dict = {}
+            for i in range(F_dec):
+                labels_i = self._build_future_masked_labels(masked_labels, i)
+                action_logits_i = GamepadDirectActionLogits(
+                    buttons=action_logits_all.buttons[:, :, i, :],
+                    left_stick_x=action_logits_all.left_stick_x[:, :, i, :],
+                    left_stick_y=action_logits_all.left_stick_y[:, :, i, :],
+                    right_stick_x=action_logits_all.right_stick_x[:, :, i, :],
+                    right_stick_y=action_logits_all.right_stick_y[:, :, i, :],
+                )
+                aux = auxiliary_losses if i == 0 else {}
+                loss_i, _, losses_i = self._calculate_action_losses_from_logits_eager(
+                    action_logits=action_logits_i,
+                    masked_labels=labels_i,
+                    auxiliary_losses=aux,
+                    batch_size=action_out_embeddings.shape[0],
+                    T=action_out_embeddings.shape[1],
+                )
+                if total_action_loss is None:
+                    total_action_loss = loss_i
+                    total_losses = dict(losses_i)
+                else:
+                    total_action_loss = total_action_loss + loss_i
+                    for k, v in losses_i.items():
+                        total_losses[k] = total_losses.get(k, 0) + v
+            action_loss = total_action_loss / F_dec
+            losses = {k: v / F_dec for k, v in total_losses.items()}
+        else:
+            action_logits = self.action_out_tokens_to_logits(action_out_embeddings)
+            action_loss, losses = self._calculate_action_loss_from_logits(
+                action_logits, masked_labels, auxiliary_losses
+            )
+
+        total_loss = action_loss + self.future_vision_loss_weight * future_vision_loss
+        losses["stamo"] = future_vision_loss
+
+        val_set_name = list(self.trainer.val_dataloaders.keys())[dataloader_idx]
+        val_metrics = self._validation_metrics[val_set_name]
+        val_metrics["perplexity"].update(cross_entropy_to_perplexity(total_loss))
+        if "perplexity_rz_loss" in val_metrics:
+            val_metrics["perplexity_rz_loss"].update(
+                cross_entropy_to_perplexity(losses.get("rz_loss", total_loss.new_zeros(())))
+            )
+        if "perplexity_lb_loss" in val_metrics:
+            val_metrics["perplexity_lb_loss"].update(
+                cross_entropy_to_perplexity(losses.get("lb_loss", total_loss.new_zeros(())))
+            )
+
+    def _compute_effective_mask(self, user_action_mask, valid_frame_mask, system_action_mask):
+        return valid_frame_mask & user_action_mask
+
+    def on_train_batch_start(self, batch, batch_idx):
+        global_step = self.trainer.global_step
+        if (
+            global_step == 0
+            and self.config.stage3_finetune.freeze_transformer_layers_for_steps > 0
+            and not self._already_frozen
+        ):
+            for param in self.bc_transformer.parameters():
+                param.requires_grad = False
+            for param in self.image_tokenizer.parameters():
+                param.requires_grad = False
+            self._already_frozen = True
+        elif (
+            global_step == self.config.stage3_finetune.freeze_transformer_layers_for_steps
+            and not self._already_unfrozen
+        ):
+            for param in self.bc_transformer.parameters():
+                param.requires_grad = True
+            for param in self.image_tokenizer.parameters():
+                param.requires_grad = True
+            self._already_unfrozen = True
+
+
+def train_stage3_stamo_future_vision(config: LightningPolicyConfig):
+    """Train Stage3StaMoFutureVisionLightning (policy + N-step StaMo future state heads)."""
+    datamodule = Stage3DataModule(config)
+    run_id = getattr(config.wandb, "run_id", None) or os.environ.get("WANDB_RUN_ID")
+    if not run_id:
+        run_id = wandb.util.generate_id()
+    os.environ["WANDB_RUN_ID"] = run_id
+    config.wandb.run_id = run_id
+
+    wandb_logger_kwargs = {
+        "project": config.wandb.project,
+        "name": config.wandb.exp_name + "_stamo_cotrain",
+        "version": run_id,
+        "id": run_id,
+        "log_model": False,
+        "save_code": False,
+        "save_dir": ELEFANT_WANDB_DIR,
+        "config": config.model_dump(),
+        "group": config.wandb.exp_name,
+        "job_type": "train",
+        "mode": "online" if config.wandb.enabled else "disabled",
+    }
+    if config.wandb.entity is not None:
+        wandb_logger_kwargs["entity"] = config.wandb.entity
+
+    wandb_logger = pl.pytorch.loggers.WandbLogger(**wandb_logger_kwargs)
+
+    checkpoint_path = f"{config.shared.output_path}/stage3_stamo_cotrain"
+    upload_model_config(checkpoint_path, config)
+    upload_action_mapping(checkpoint_path, datamodule.get_action_mapping())
+
+    resume_checkpoint = None
+    if config.stage3_finetune.init.stage3_model_path:
+        resume_checkpoint = config.stage3_finetune.init.stage3_model_path
+        logging.info("Using checkpoint from config: %s", resume_checkpoint)
+    elif config.stage3_finetune.init.auto_resume_latest_checkpoint:
+        import glob
+        checkpoint_pattern = os.path.join(checkpoint_path, "checkpoint-step=*.ckpt")
+        checkpoints = glob.glob(checkpoint_pattern)
+        if checkpoints:
+            checkpoints.sort(reverse=True)
+            resume_checkpoint = checkpoints[0]
+            logging.info("Found latest checkpoint: %s", resume_checkpoint)
+        else:
+            logging.info("No checkpoint found, starting training from scratch.")
+
+    async_checkpointer = AsyncCheckpointIO()
+    checkpoint_callback = ModelCheckpoint(
+        dirpath=checkpoint_path,
+        every_n_train_steps=config.stage3_finetune.save_every_n_steps,
+        filename="checkpoint-{step:08d}",
+        enable_version_counter=False,
+        save_top_k=-1,
+    )
+
+    from datetime import timedelta
+    if torch.cuda.device_count() > 1:
+        strategy = pl.pytorch.strategies.DDPStrategy(
+            find_unused_parameters=config.shared.action_mapping_type == "gamepad_direct",
+            timeout=timedelta(seconds=7200),
+        )
+    else:
+        strategy = "auto"
+
+    trainer = pl.Trainer(
+        plugins=[async_checkpointer],
+        callbacks=[checkpoint_callback],
+        accelerator="auto",
+        devices="auto",
+        max_steps=config.stage3_finetune.n_training_steps,
+        logger=wandb_logger,
+        val_check_interval=config.stage3_finetune.validation_step_interval
+        * config.stage3_finetune.accumulate_grad_batches,
+        limit_val_batches=config.stage3_finetune.n_validation_steps,
+        check_val_every_n_epoch=None,
+        precision=config.shared.precision,
+        accumulate_grad_batches=config.stage3_finetune.accumulate_grad_batches,
+        fast_dev_run=config.shared.fast_dev_run,
+        strategy=strategy,
+        num_sanity_val_steps=0,
+    )
+
+    with trainer.init_module():
+        model = Stage3StaMoFutureVisionLightning(config)
+
+    total_params, expert_params = count_model_parameters(model)
+    logging.info("Total parameters: %d, Expert parameters: %d", total_params, expert_params)
+
+    trainer.fit(model, datamodule, ckpt_path=resume_checkpoint)
+
+    wandb_logger.experiment.finish()
+    return async_checkpointer.get_final_checkpoint()

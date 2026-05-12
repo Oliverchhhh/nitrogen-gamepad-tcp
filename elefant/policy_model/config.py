@@ -98,6 +98,9 @@ class PolicyModelConfig(TransformerModelConfig):
     # If True, never feed real action tokens into the transformer cache
     # (disables teacher-forcing action input in both train/inference paths).
     zero_action_input: bool = False
+    # Number of learnable s0 state tokens per step for StaMo co-training.
+    # Each s0_k predicts the StaMo representation of frame t+k+1.
+    n_future_state_tokens: int = 0
 
 
 class AdamWOptimConfig(ConfigBase):
@@ -199,6 +202,33 @@ class Stage3FineTuneConfig(PolicyTrainingConfig):
             "instead of running the state_target_tokenizer online. "
             "This avoids loading the V-JEPA2 model and speeds up training."
         ),
+    )
+    # StaMo co-training specific fields
+    stamo_checkpoint_dir: Optional[str] = pydantic.Field(
+        default=None,
+        description=(
+            "Path to StaMo checkpoint directory containing RenderNet.pth and Projector.pth. "
+            "Required when use_precomputed_stamo_features=False."
+        ),
+    )
+    use_precomputed_stamo_features: bool = pydantic.Field(
+        default=False,
+        description=(
+            "If True, use precomputed StaMo features (stamo_features.pt) from each chunk directory "
+            "instead of running the StaMo encoder online."
+        ),
+    )
+    bc_checkpoint_path: Optional[str] = pydantic.Field(
+        default=None,
+        description=(
+            "Path to a BC (behaviour-cloning) checkpoint to initialise the policy weights "
+            "before StaMo co-training. Loaded with strict=False so that new parameters "
+            "(state_out_tokens_param, future_vision_heads) start from random init."
+        ),
+    )
+    future_vision_loss_weight: float = pydantic.Field(
+        default=0.1,
+        description="Weight for the future vision (StaMo) prediction loss relative to action loss.",
     )
 
 

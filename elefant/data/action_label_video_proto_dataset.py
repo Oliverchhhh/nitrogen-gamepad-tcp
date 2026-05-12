@@ -54,6 +54,8 @@ class ActionLabelVideoDatasetItem(NamedTuple):
     valid_frame_mask: torch.Tensor | None = None
     # 预计算的 V-JEPA2 全局视觉表征 (T, embed_dim)，用于离线 state target
     precomputed_vision_features: torch.Tensor | None = None
+    # 预计算的 StaMo 表征 (T, 8192)，Path B 离线加载
+    precomputed_stamo_features: torch.Tensor | None = None
 
 
 class ActionLabelAnnotationParser(ProtoParser):

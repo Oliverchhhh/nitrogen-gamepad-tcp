@@ -225,6 +225,17 @@ def _preprocess_example(
             logging.warning(f"Failed to load precomputed features {features_path}: {e}")
             precomputed_features = None
 
+    # 加载预计算的 StaMo 表征（Path B，如果存在）
+    precomputed_stamo = None
+    stamo_path = os.path.join(os.path.dirname(video), "stamo_features.pt")
+    if os.path.exists(stamo_path):
+        try:
+            stamo_data = torch.load(stamo_path, map_location="cpu", weights_only=True)
+            precomputed_stamo = stamo_data["features"]  # [T, 8192]
+        except Exception as e:
+            logging.warning(f"Failed to load precomputed stamo features {stamo_path}: {e}")
+            precomputed_stamo = None
+
     if config.shuffle:
         # to avoid negative ranges when n_frames < T+1
         max_start = max(0, n_frames - (config.T + 1))
@@ -273,6 +284,18 @@ def _preprocess_example(
                     pad = precomputed_features[-1:].expand(feat_end - n_feat, -1)
                     chunk_features = torch.cat([available, pad], dim=0)
                 example = example._replace(precomputed_vision_features=chunk_features)
+            # 附加预计算的 StaMo 表征切片（Path B）
+            if precomputed_stamo is not None:
+                feat_start = start_frame
+                feat_end = start_frame + config.T
+                n_feat = precomputed_stamo.shape[0]
+                if feat_end <= n_feat:
+                    chunk_stamo = precomputed_stamo[feat_start:feat_end]
+                else:
+                    available = precomputed_stamo[feat_start:n_feat]
+                    pad = precomputed_stamo[-1:].expand(feat_end - n_feat, -1)
+                    chunk_stamo = torch.cat([available, pad], dim=0)
+                example = example._replace(precomputed_stamo_features=chunk_stamo)
             preprocessed_chunks_queue.put(example)
 
         start_frame += stride
@@ -321,6 +344,18 @@ def _preprocess_example(
                     pad = precomputed_features[-1:].expand(feat_end - n_feat, -1)
                     chunk_features = torch.cat([available, pad], dim=0)
                 example = example._replace(precomputed_vision_features=chunk_features)
+            # 附加预计算的 StaMo 表征切片（Path B，尾帧）
+            if precomputed_stamo is not None:
+                feat_start = start_frame
+                feat_end = start_frame + config.T
+                n_feat = precomputed_stamo.shape[0]
+                if feat_end <= n_feat:
+                    chunk_stamo = precomputed_stamo[feat_start:feat_end]
+                else:
+                    available = precomputed_stamo[feat_start:n_feat]
+                    pad = precomputed_stamo[-1:].expand(feat_end - n_feat, -1)
+                    chunk_stamo = torch.cat([available, pad], dim=0)
+                example = example._replace(precomputed_stamo_features=chunk_stamo)
             preprocessed_chunks_queue.put(example)
     del decoder
 

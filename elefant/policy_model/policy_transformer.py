@@ -970,6 +970,423 @@ class MoEPolicyCausalTransformer(PolicyCausalTransformer):
         self._transformer = MoETransformer(config=self.config)
 
 
+def _img_policy_stamo_future_causal_mask(
+    layer_idx: int,
+    n_img_tokens: int,
+    n_thinking_tokens: int,
+    n_action_tokens: int,
+    history_len: Optional[int] = None,
+    n_text_tokens: int = 0,
+    n_kv_sink_tokens: int = 0,
+    n_future_state_tokens: int = 1,
+):
+    """
+    StaMo co-training causal mask. Per-step layout:
+      [text(n_text), img(n_img), think(n_think), s0_0...s0_{N-1}(N), a0(1), real_action...]
+
+    where n_action_tokens = N + 1 (a0) + n_real_action.
+
+    Attention rules:
+    - img/think: cross-step img/think (prev steps only) + same-step img/think
+    - s0_k tokens: cross-step img/think + same-step img/think + bidirectional all N s0
+    - a0: cross-step img/think + same-step img/think + all N s0 + itself
+    - real_action: cross-step img/think + same-step img/think
+    """
+
+    def _mask(b, h, q_idx, kv_idx):
+        is_sink = kv_idx < n_kv_sink_tokens
+        kv_idx_base = kv_idx - n_kv_sink_tokens
+
+        one_step_len = n_img_tokens + n_text_tokens + n_thinking_tokens + n_action_tokens
+        token_to_first_state_out = n_img_tokens + n_thinking_tokens + n_text_tokens
+        token_to_action_out = token_to_first_state_out + n_future_state_tokens
+
+        q_pos = q_idx % one_step_len
+        q_step = q_idx // one_step_len
+        kv_pos = kv_idx_base % one_step_len
+        kv_step = kv_idx_base // one_step_len
+
+        q_is_img_or_think = q_pos < token_to_first_state_out
+        q_is_state_out = (q_pos >= token_to_first_state_out) & (q_pos < token_to_action_out)
+        q_is_action_out = q_pos == token_to_action_out
+        q_is_real_action = q_pos > token_to_action_out
+
+        kv_is_img_or_think = kv_pos < token_to_first_state_out
+        kv_is_state_out = (kv_pos >= token_to_first_state_out) & (kv_pos < token_to_action_out)
+        kv_is_action_out = kv_pos == token_to_action_out
+
+        cross_step = kv_is_img_or_think & (kv_step < q_step)
+        same_step = kv_step == q_step
+
+        full_mask = (
+            (q_is_img_or_think & (cross_step | (same_step & kv_is_img_or_think)))
+            | (q_is_state_out & (cross_step | (same_step & (kv_is_img_or_think | kv_is_state_out))))
+            | (q_is_action_out & (cross_step | (same_step & (kv_is_img_or_think | kv_is_state_out | kv_is_action_out))))
+            | (q_is_real_action & (cross_step | (same_step & kv_is_img_or_think)))
+        )
+
+        if history_len is not None:
+            full_mask = full_mask & ((q_step - kv_step) <= history_len)
+
+        return is_sink | full_mask
+
+    return _mask
+
+
+class PolicyStaMoFutureCausalTransformer(PolicyCausalTransformer):
+    """
+    Policy Transformer with N future StaMo state representation prediction heads.
+
+    Extends PolicyCausalTransformer with N learnable s0 tokens per step. Each s0_k
+    predicts the StaMo encoding of frame t+k+1 via a Linear(embed_dim, 8192) head.
+    a0 attends all N s0 tokens at the same step during training.
+
+    Per-step layout: [text, img, think, s0_0, ..., s0_{N-1}, a0, real_action...]
+
+    At inference time, n_future_attend controls how many s0 tokens a0 can attend,
+    enabling ablation experiments (1/5/10 future state tokens).
+    """
+
+    STAMO_HIDDEN_DIM = 8192  # 2 StaMo tokens × 4096-dim, flattened
+
+    def __init__(
+        self,
+        config: PolicyCausalTransformerConfig,
+        image_tokenizer: ImageBaseTokenizer,
+        inference_mode: bool = False,
+        mask_fn: Optional[Callable] = None,
+        future_vision_loss_weight: float = 0.1,
+        n_future_state_tokens: int = 1,
+    ):
+        if mask_fn is None:
+            mask_fn = _img_policy_stamo_future_causal_mask
+        self.n_future_state_tokens = n_future_state_tokens
+        super().__init__(config, image_tokenizer, inference_mode, mask_fn)
+
+        self.future_vision_loss_weight = future_vision_loss_weight
+
+        # N learnable state-out token embeddings (one per future frame to predict)
+        self.state_out_tokens_param = nn.Parameter(
+            torch.empty(1, n_future_state_tokens, config.embed_dim, dtype=torch.bfloat16)
+        )
+        torch.nn.init.normal_(self.state_out_tokens_param, mean=0.0, std=self.embedding_std)
+
+        # Recompute max_seq_len: N s0 + 1 a0 + n_real_action per step
+        self.max_seq_len = (
+            self.image_tokenizer.get_n_img_tokens()
+            + self.text_token_size
+            + self.config.n_thinking_tokens
+            + n_future_state_tokens
+            + 1  # a0
+            + self.config.n_action_tokens
+        ) * config.n_steps
+        self._transformer.max_seq_len = self.max_seq_len
+        self._transformer.rebuild_rope_cache(self.max_seq_len)
+
+        self.n_tokens_to_first_action = (
+            self.image_tokenizer.get_n_img_tokens()
+            + self.text_token_size
+            + self.config.n_thinking_tokens
+            + n_future_state_tokens
+            + 1  # a0
+        )
+
+        # Pre-compute flat sequence indices for a0 and each s0_k token
+        step_len = (
+            self.image_tokenizer.get_n_img_tokens()
+            + self.text_token_size
+            + self.config.n_thinking_tokens
+            + n_future_state_tokens
+            + 1
+            + self.config.n_action_tokens
+        )
+        output_action_token_idx = []
+        output_state_token_idxs = [[] for _ in range(n_future_state_tokens)]
+        for i in range(self.config.n_steps):
+            step_start = i * step_len
+            first_state_idx = (
+                step_start
+                + self.image_tokenizer.get_n_img_tokens()
+                + self.text_token_size
+                + self.config.n_thinking_tokens
+            )
+            for k in range(n_future_state_tokens):
+                output_state_token_idxs[k].append(first_state_idx + k)
+            output_action_token_idx.append(first_state_idx + n_future_state_tokens)
+
+        # Register as buffers (auto-moved to GPU with model.to(device))
+        self.register_buffer(
+            "output_action_token_idx",
+            torch.tensor(output_action_token_idx, dtype=torch.long),
+            persistent=False,
+        )
+        self.register_buffer(
+            "output_state_token_idxs_buf",
+            torch.tensor(output_state_token_idxs, dtype=torch.long),  # [N, T]
+            persistent=False,
+        )
+
+        # Re-assign layer masks with the correct max_seq_len and N state tokens
+        self._assign_layer_masks()
+
+        # N prediction heads: embed_dim → STAMO_HIDDEN_DIM
+        self.future_vision_heads = nn.ModuleList([
+            nn.Linear(config.embed_dim, self.STAMO_HIDDEN_DIM, bias=False)
+            for _ in range(n_future_state_tokens)
+        ])
+        for head in self.future_vision_heads:
+            torch.nn.init.normal_(head.weight, mean=0.0, std=0.02)
+
+    def _assign_layer_masks(self):
+        assert len(self.config.attention_history_len) == len(
+            self._transformer.transformer_layers
+        ), "Number of transformer layers and list of attention n frames should match"
+        assert max(self.config.attention_history_len) == self.config.n_steps, (
+            "Max attention history len should be equal to the n_steps"
+        )
+        self._transformer._layer_mask_fns = []
+
+        N = self.n_future_state_tokens
+        # n_action_tokens for the mask: N s0 + 1 a0 + n_real_action
+        n_action_tokens_for_mask = (N + 1) + self.config.n_action_tokens
+
+        for i, layer in enumerate(self._transformer.transformer_layers):
+            if not isinstance(layer, TransformerSelfAttentionLayer):
+                self._transformer._layer_mask_fns.append(None)
+                continue
+            allowed_frames = self.config.attention_history_len[i]
+            layer_mask_fn = self._mask_fn(
+                layer_idx=i,
+                n_img_tokens=self.image_tokenizer.get_n_img_tokens(),
+                n_thinking_tokens=self.config.n_thinking_tokens,
+                n_action_tokens=n_action_tokens_for_mask,
+                history_len=allowed_frames,
+                n_kv_sink_tokens=self.config.n_kv_sink_tokens,
+                n_text_tokens=self.text_token_size,
+                n_future_state_tokens=N,
+            )
+            self._transformer._layer_mask_fns.append(layer_mask_fn)
+            layer.self_attention.block_mask = fa.create_block_mask(
+                layer_mask_fn,
+                B=None,
+                H=None,
+                Q_LEN=self.max_seq_len,
+                KV_LEN=self.max_seq_len + self.config.n_kv_sink_tokens,
+                BLOCK_SIZE=self.config.mask_block_size,
+                device=self.device,
+            )
+
+    def forward(
+        self,
+        img: torch.Tensor,
+        action_embeddings_in: torch.Tensor,
+        text_tokens_embed: torch.Tensor,
+        should_grow_cache: bool = None,
+        input_pos: Optional[torch.Tensor] = None,
+        skip_action_decoder: bool = False,
+    ):
+        B, T, *_ = img.shape
+        img_tokens = self.image_tokenizer(img)
+        eager_assert(
+            text_tokens_embed.shape,
+            (B, T, self.text_token_size, self.text_tokenizer_embed_dim),
+        )
+        eager_assert(
+            img_tokens.shape,
+            (B, T, self.image_tokenizer.get_n_img_tokens(), self.config.embed_dim),
+        )
+        eager_assert(
+            action_embeddings_in.shape,
+            (B, T, self.config.n_action_tokens, self.config.embed_dim),
+        )
+
+        img_tokens_with_pos = img_tokens + self.img_pos_tokens.unsqueeze(0)
+        action_tokens_with_pos = action_embeddings_in + self.action_pos_tokens.unsqueeze(0)
+
+        text_tokens_embed = self.text_embed_mlp(text_tokens_embed)
+        text_tokens_embed = text_tokens_embed.reshape(
+            B * T, self.text_token_size, self.config.embed_dim
+        )
+        text_tokens_embed = self._impute_no_text_embedding(text_tokens_embed)
+        text_tokens_embed = text_tokens_embed.reshape(
+            B, T, self.text_token_size, self.config.embed_dim
+        )
+        text_embeddings_with_pos = text_tokens_embed + self.text_pos_tokens
+
+        batch_thinking_pos_tokens = self.thinking_pos_tokens.repeat(B, 1, 1)
+        batch_state_out_tokens = self.state_out_tokens_param.repeat(B, 1, 1)  # [B, N, D]
+        batch_action_out_tokens = self.action_out_tokens.repeat(B, 1, 1)       # [B, 1, D]
+
+        x = []
+        for i in range(self.config.n_steps):
+            this_step_in = torch.cat(
+                [
+                    text_embeddings_with_pos[:, i],
+                    img_tokens_with_pos[:, i],
+                    batch_thinking_pos_tokens,
+                    batch_state_out_tokens,     # [B, N, D]
+                    batch_action_out_tokens,    # [B, 1, D]
+                    action_tokens_with_pos[:, i],
+                ],
+                dim=1,
+            )
+            x.append(this_step_in)
+        x = torch.cat(x, dim=1)
+        eager_assert(x.shape, (B, self.max_seq_len, self.config.embed_dim))
+
+        y, _, auxiliary_losses, auxiliary_outputs = self._transformer.forward(
+            x, input_pos=input_pos, should_grow_cache=should_grow_cache
+        )
+        eager_assert(y.shape, (B, self.max_seq_len, self.config.embed_dim))
+
+        # Extract a0 output: [B, T, D]
+        action_out_tokens = torch.index_select(
+            y, dim=1, index=self.output_action_token_idx
+        )
+
+        # Extract s0 outputs for each of the N state tokens: [B, T, N, D]
+        N = self.n_future_state_tokens
+        state_out_list = []
+        for k in range(N):
+            state_k_idx = self.output_state_token_idxs_buf[k]  # [T]
+            state_k = torch.index_select(y, dim=1, index=state_k_idx)  # [B, T, D]
+            state_out_list.append(state_k)
+        state_out_tokens = torch.stack(state_out_list, dim=2)  # [B, T, N, D]
+
+        # Apply N prediction heads → [B, T, N, STAMO_HIDDEN_DIM]
+        future_vision_preds = []
+        for k in range(N):
+            pred_k = self.future_vision_heads[k](state_out_tokens[:, :, k, :])
+            future_vision_preds.append(pred_k)
+        future_vision_pred = torch.stack(future_vision_preds, dim=2)  # [B, T, N, 8192]
+
+        if skip_action_decoder:
+            action_out_tokens_reshaped = action_out_tokens.unsqueeze(2)  # [B, T, 1, D]
+            return (
+                action_out_tokens_reshaped,
+                action_out_tokens,
+                future_vision_pred,
+                auxiliary_losses,
+                auxiliary_outputs,
+            )
+
+        action_out = self.action_decoder(
+            action_embeddings_in=action_embeddings_in,
+            input_action_token=action_out_tokens,
+        )
+        return action_out, action_out_tokens, future_vision_pred, auxiliary_losses, auxiliary_outputs
+
+    def online_forward(
+        self,
+        img: torch.Tensor,
+        text_tokens_embed: torch.Tensor,
+        idx: torch.Tensor,
+        kv_cache_state: Optional[List[KVCacheState]] = None,
+        should_grow_cache: bool = None,
+        action_sampler: Callable = None,
+        empty_sampled_action_fn: Callable = None,
+        reshape_structured_action_fn: Callable = None,
+        action_in_to_tokens_fn: Callable = None,
+        direct_action_head_fn: Callable = None,
+        n_future_attend: int = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Single-step inference with KV cache. n_future_attend controls how many
+        s0 tokens a0 can attend (default: all N tokens)."""
+        B, T, C, H, W = img.shape
+        eager_assert(T, 1)
+        eager_assert(B, 1)
+        N = self.n_future_state_tokens
+
+        img_tokens = self.image_tokenizer(img)
+        img_tokens = img_tokens.view(
+            B, self.image_tokenizer.get_n_img_tokens(), self.config.embed_dim
+        )
+        img_tokens_with_pos = img_tokens + self.img_pos_tokens
+        text_tokens_embed = text_tokens_embed.view(
+            B, self.text_token_size, self.text_tokenizer_embed_dim
+        ).to(self.device)
+        text_tokens_embed = self.text_embed_mlp(text_tokens_embed)
+        text_tokens_embed = self._impute_no_text_embedding(text_tokens_embed)
+        text_tokens_embed_with_pos = text_tokens_embed + self.text_pos_tokens
+
+        input_pos = (
+            torch.arange(
+                self.image_tokenizer.get_n_img_tokens()
+                + self.text_token_size
+                + self.config.n_thinking_tokens
+                + N + 1
+                + self.config.n_action_tokens,
+                device=idx.device,
+                dtype=idx.dtype,
+            )
+            + idx
+        )
+
+        batch_thinking_pos_tokens = self.thinking_pos_tokens.repeat(B, 1, 1)
+        batch_state_out_tokens = self.state_out_tokens_param.repeat(B, 1, 1)  # [B, N, D]
+        batch_action_out_tokens = self.action_out_tokens.repeat(B, 1, 1)
+        dummy_action_embeddings_in = torch.zeros(
+            B,
+            self.config.n_action_tokens,
+            self.config.embed_dim,
+            device=batch_action_out_tokens.device,
+        )
+        x = torch.cat(
+            [
+                text_tokens_embed_with_pos,
+                img_tokens_with_pos,
+                batch_thinking_pos_tokens,
+                batch_state_out_tokens,
+                batch_action_out_tokens,
+                dummy_action_embeddings_in,
+            ],
+            dim=1,
+        )
+        y, kv_cache_state, *_ = self._transformer.forward(
+            x,
+            input_pos=input_pos,
+            kv_cache_state=kv_cache_state,
+            should_grow_cache=should_grow_cache,
+            use_decode_mask=True,
+        )
+
+        # a0 is at position: n_text + n_img + n_think + N
+        action_out_position = (
+            self.image_tokenizer.get_n_img_tokens()
+            + self.text_token_size
+            + self.config.n_thinking_tokens
+            + N
+        )
+        action_token_out = y[:, action_out_position : action_out_position + 1]
+        if direct_action_head_fn is not None:
+            sampled_action = direct_action_head_fn(action_token_out)
+        else:
+            sampled_action = self.action_decoder.autogressive_sample(
+                action_token_out,
+                action_sampler,
+                empty_sampled_action_fn,
+                reshape_structured_action_fn,
+                inference_mode=True,
+            )
+
+        next_idx = input_pos[-1] + 1
+
+        # Compute future vision predictions from s0 tokens
+        state_out_start = (
+            self.image_tokenizer.get_n_img_tokens()
+            + self.text_token_size
+            + self.config.n_thinking_tokens
+        )
+        state_out_tokens = y[:, state_out_start : state_out_start + N, :]  # [B, N, D]
+        future_vision_preds = []
+        for k in range(N):
+            pred_k = self.future_vision_heads[k](state_out_tokens[:, k : k + 1, :])
+            future_vision_preds.append(pred_k)
+        future_vision_pred = torch.cat(future_vision_preds, dim=1)  # [B, N, STAMO_HIDDEN_DIM]
+
+        return sampled_action, next_idx, kv_cache_state, future_vision_pred
+
+
 class PolicyFutureCausalTransformer(PolicyCausalTransformer):
     """
     Policy Transformer with future vision prediction head.
