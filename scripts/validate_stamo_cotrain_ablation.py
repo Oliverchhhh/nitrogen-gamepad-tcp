@@ -223,7 +223,9 @@ def main():
     datamodule = Stage3DataModule(config)
     datamodule.setup("validate")
     val_loaders = datamodule.val_dataloader()
-    if isinstance(val_loaders, list):
+    if isinstance(val_loaders, dict):
+        val_loader = list(val_loaders.values())[0]
+    elif isinstance(val_loaders, list):
         val_loader = val_loaders[0]
     else:
         val_loader = val_loaders
