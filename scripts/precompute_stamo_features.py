@@ -34,7 +34,7 @@ import torchvision.transforms.functional as tvF
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-_STAMO_REPO = "/home/ch/StaMo"
+_STAMO_REPO = os.environ.get("STAMO_REPO", "/home/ch/StaMo")
 
 
 def load_stamo_encoder(checkpoint_dir: str) -> "StaMoEncoder":

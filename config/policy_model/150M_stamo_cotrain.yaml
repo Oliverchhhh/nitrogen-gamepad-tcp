@@ -24,7 +24,7 @@ shared:
       expected_n_img_tokens: 256
       vision_hidden_size: 1024
       pool_to_single_token: true
-      nitrogen_checkpoint_path: "NitroGen_checkpoints/ng.pt"
+      nitrogen_checkpoint_path: "./checkpoints/NitroGen/ng.pt"
       strict_load: false
 
 inference:
@@ -59,22 +59,22 @@ stage3_finetune:
 
   validation_step_interval: 999999
   n_validation_steps: &n_validation_steps 0
-  save_every_n_steps: 30000
-  n_training_steps: 300000
+  save_every_n_steps: 10000
+  n_training_steps: 40000
   accumulate_grad_batches: 1
 
   # StaMo co-training configuration
   future_vision_loss_weight: 0.1
   # Path to StaMo checkpoint directory (contains RenderNet.pth and Projector.pth)
   # Replace with the actual path when the checkpoint is available on the server
-  stamo_checkpoint_dir: "PLACEHOLDER_StaMo_checkpoint_dir"
-  use_precomputed_stamo_features: false
+  stamo_checkpoint_dir: null
+  use_precomputed_stamo_features: true
   # Optional: path to a pre-trained BC policy checkpoint to warm-start the policy
   # Set to null to train from scratch
-  bc_checkpoint_path: null
+  bc_checkpoint_path: "./checkpoints/open-p2p-gamepad/checkpoint-step=00300000.ckpt"
 
   training_dataset:
-    batch_size: &stage3_batch_size 1
+    batch_size: &stage3_batch_size 8
     local_prefix: "cuphead_dataset_converted"
     load_video_name: "256x256.mp4"
     warn_on_starvation: false
@@ -104,7 +104,7 @@ stage3_finetune:
       always_labelled: true
 
 wandb:
-  enabled: True
+  enabled: False
   entity: "zjut-cv"
   project: "policy_model"
   exp_name: "150M-stamo-cotrain-N10-F18"

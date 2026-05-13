@@ -18,7 +18,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-_STAMO_REPO = "/home/ch/StaMo"
+_STAMO_REPO = os.environ.get("STAMO_REPO", "/home/ch/StaMo")
 
 _STAMO_ARCH = SimpleNamespace(
     # VisionBackbone: DINOv2 ViT-Base with register tokens, 336×336 input

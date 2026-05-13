@@ -151,8 +151,7 @@ class TimingMetrics:
             return stats
 
 
-# TODO: should get this from the model config.
-MODEL_INPUT_HEIGHT = 192
+MODEL_INPUT_HEIGHT = 192  # default; overridden per-instance from config.shared
 MODEL_INPUT_WIDTH = 192
 
 
@@ -568,6 +567,7 @@ class InferenceServer(UnixDomainSocketInferenceServer):
         transport: str = "uds",
         bind_host: str = "0.0.0.0",
         bind_port: int = 9000,
+        action_override_seconds: float = 0.0,
     ):
         super().__init__(
             transport=transport,
@@ -578,6 +578,7 @@ class InferenceServer(UnixDomainSocketInferenceServer):
         self.shared_text_state = SharedTextInputState(input_text=input_text)
         self.input_text = input_text
         self.terminal_listener_task = None
+        self.action_override_seconds = action_override_seconds
         if not compile:
             logging.warning("!!!No compile is enabled!!!")
             torch.compiler.set_stance("force_eager")
@@ -586,6 +587,8 @@ class InferenceServer(UnixDomainSocketInferenceServer):
             self._compile_stance = "fail_on_recompile"
 
         self.config = config
+        self.model_input_height = getattr(config.shared, "frame_height", MODEL_INPUT_HEIGHT)
+        self.model_input_width = getattr(config.shared, "frame_width", MODEL_INPUT_WIDTH)
         mapping_type = getattr(self.config.shared, "action_mapping_type", "keyboard_mouse")
         if mapping_type == "gamepad":
             self.action_mapping = GamepadAutoregressiveActionMapping(
@@ -849,7 +852,7 @@ class InferenceServer(UnixDomainSocketInferenceServer):
                 next_frame = torch.randint(
                     0,
                     255,
-                    (3, MODEL_INPUT_HEIGHT, MODEL_INPUT_WIDTH),
+                    (3, self.model_input_height, self.model_input_width),
                     dtype=torch.uint8,
                     device="cpu",
                 ).to(self.device, non_blocking=True)
@@ -1014,6 +1017,13 @@ class InferenceServer(UnixDomainSocketInferenceServer):
         # Add client to active connections
         self.active_connections.add(writer)
 
+        connection_start_time = time.time()
+        if self.action_override_seconds > 0:
+            logging.info(
+                f"Action override active for {self.action_override_seconds:.0f}s: "
+                f"sending fixed gamepad right_stick=(1.0, 0.0)"
+            )
+
         request_iterator = self._make_request_iterator(reader)
         try:
             async for action in self._infer_video(request_iterator):
@@ -1023,6 +1033,31 @@ class InferenceServer(UnixDomainSocketInferenceServer):
                         f"Shutdown requested, closing connection to {client_info}"
                     )
                     break
+
+                # During override period, replace model action with fixed gamepad signal
+                if self.action_override_seconds > 0:
+                    elapsed = time.time() - connection_start_time
+                    if elapsed < self.action_override_seconds:
+                        override_keys = [
+                            "gamepad:lx=0.0000",
+                            "gamepad:ly=0.0000",
+                            "gamepad:rx=1.0000",
+                            "gamepad:ry=0.0000",
+                            "gamepad:lt=0.0000",
+                            "gamepad:rt=0.0000",
+                        ]
+                        action = video_inference_pb2.Action(
+                            keys=override_keys,
+                            id=action.id,
+                        )
+                        logging.info(
+                            f"[Override {elapsed:.0f}s/{self.action_override_seconds:.0f}s] "
+                            f"Sending action: DecodedGamepadAction(buttons_down=[], "
+                            f"left_stick=(0.0, 0.0), right_stick=(1.0, 0.0), "
+                            f"left_trigger=0.0, right_trigger=0.0)"
+                        )
+                    elif elapsed < self.action_override_seconds + 1.0:
+                        logging.info("Action override ended, switching to model output")
 
                 # Send the action back to the client
                 await self._write_action(writer, action)
@@ -1083,12 +1118,12 @@ class InferenceServer(UnixDomainSocketInferenceServer):
                     frame_tensor_chw = frame_tensor_hwc.permute(2, 0, 1)
 
                     if (
-                        req.frame.width != MODEL_INPUT_WIDTH
-                        or req.frame.height != MODEL_INPUT_HEIGHT
+                        req.frame.width != self.model_input_width
+                        or req.frame.height != self.model_input_height
                     ):
                         logging.debug("Image is incorrect size, resizing")
                         frame_tensor_resized = resize_image_for_model(
-                            frame_tensor_chw, (MODEL_INPUT_HEIGHT, MODEL_INPUT_WIDTH)
+                            frame_tensor_chw, (self.model_input_height, self.model_input_width)
                         )
                     else:
                         frame_tensor_resized = frame_tensor_chw
@@ -1282,6 +1317,7 @@ def serve_model(
     transport: str = "uds",
     bind_host: str = "0.0.0.0",
     bind_port: int = 9000,
+    action_override_seconds: float = 0.0,
 ):
     logging.basicConfig(level=logging.INFO, force=True)
 
@@ -1300,6 +1336,7 @@ def serve_model(
         transport=transport,
         bind_host=bind_host,
         bind_port=bind_port,
+        action_override_seconds=action_override_seconds,
     )
 
     # Setup signal handlers for non-asyncio contexts
@@ -1389,6 +1426,12 @@ def _main():
         default=int(os.environ.get("P2P_BIND_PORT", "9000")),
         help="TCP bind port (default: 9000). Env: P2P_BIND_PORT",
     )
+    parser.add_argument(
+        "--action-override-seconds",
+        type=float,
+        default=0.0,
+        help="Override model output with fixed gamepad right_stick=(1.0,0.0) for this many seconds after connection (default: 0 = disabled).",
+    )
     args = parser.parse_args()
 
     if args.use_full_inference and args.use_manual_sampling:
@@ -1423,6 +1466,7 @@ def _main():
             transport=args.transport,
             bind_host=args.bind_host,
             bind_port=args.bind_port,
+            action_override_seconds=args.action_override_seconds,
         )
 
 
