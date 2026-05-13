@@ -669,7 +669,14 @@ class VideoProtoDataset(torch.utils.data.IterableDataset, ABC):
             collated = {}
             for field in fields:
                 vals = [getattr(b, field) for b in batch]
-                if vals[0] is None:
+                if all(v is None for v in vals):
+                    collated[field] = None
+                elif any(v is None for v in vals):
+                    # 部分样本缺少预计算特征（如对应 .pt 文件不存在），跳过整个字段
+                    logging.warning(
+                        f"_collate_fn: field '{field}' has mixed None/Tensor in batch "
+                        f"({sum(v is None for v in vals)}/{len(vals)} None). Setting to None."
+                    )
                     collated[field] = None
                 else:
                     collated[field] = default_collate(vals)

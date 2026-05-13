@@ -3024,6 +3024,12 @@ class Stage3StaMoFutureVisionLightning(PolicyModelTrainer):
         if precomputed_stamo_features is not None:
             all_feats = precomputed_stamo_features.to(dtype=dtype, device=device)
         else:
+            if self.stamo_encoder is None:
+                raise RuntimeError(
+                    "precomputed_stamo_features is None but stamo_encoder is also None. "
+                    "use_precomputed_stamo_features=True requires stamo_features.pt in every chunk. "
+                    "Run scripts/precompute_stamo_features.py first."
+                )
             with torch.no_grad():
                 frames_flat = frames.reshape(B * T, *frames.shape[2:])
                 embeds = self.stamo_encoder.encode(frames_flat)   # [B*T, 2, 4096]
