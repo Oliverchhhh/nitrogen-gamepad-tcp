@@ -1033,6 +1033,70 @@ def _img_policy_stamo_future_causal_mask(
     return _mask
 
 
+def _img_policy_stamo_future_causal_mask_k_attend(
+    layer_idx: int,
+    n_img_tokens: int,
+    n_thinking_tokens: int,
+    n_action_tokens: int,
+    history_len: Optional[int] = None,
+    n_text_tokens: int = 0,
+    n_kv_sink_tokens: int = 0,
+    n_future_state_tokens: int = 1,
+    n_future_attend: int = 0,
+):
+    """
+    Ablation variant of the StaMo co-training mask.
+    Identical to _img_policy_stamo_future_causal_mask except that a0 can only
+    attend the first n_future_attend s0 tokens (instead of all N).
+    n_future_attend=0: a0 sees no s0 tokens (pure co-training effect, no prediction benefit).
+    n_future_attend=N: identical to training mask.
+    """
+
+    def _mask(b, h, q_idx, kv_idx):
+        is_sink = kv_idx < n_kv_sink_tokens
+        kv_idx_base = kv_idx - n_kv_sink_tokens
+
+        one_step_len = n_img_tokens + n_text_tokens + n_thinking_tokens + n_action_tokens
+        token_to_first_state_out = n_img_tokens + n_thinking_tokens + n_text_tokens
+        token_to_action_out = token_to_first_state_out + n_future_state_tokens
+
+        q_pos = q_idx % one_step_len
+        q_step = q_idx // one_step_len
+        kv_pos = kv_idx_base % one_step_len
+        kv_step = kv_idx_base // one_step_len
+
+        q_is_img_or_think = q_pos < token_to_first_state_out
+        q_is_state_out = (q_pos >= token_to_first_state_out) & (q_pos < token_to_action_out)
+        q_is_action_out = q_pos == token_to_action_out
+        q_is_real_action = q_pos > token_to_action_out
+
+        kv_is_img_or_think = kv_pos < token_to_first_state_out
+        kv_is_state_out = (kv_pos >= token_to_first_state_out) & (kv_pos < token_to_action_out)
+        # a0 attends only the first n_future_attend s0 tokens
+        kv_is_first_k_state = (
+            (kv_pos >= token_to_first_state_out)
+            & (kv_pos < token_to_first_state_out + n_future_attend)
+        )
+        kv_is_action_out = kv_pos == token_to_action_out
+
+        cross_step = kv_is_img_or_think & (kv_step < q_step)
+        same_step = kv_step == q_step
+
+        full_mask = (
+            (q_is_img_or_think & (cross_step | (same_step & kv_is_img_or_think)))
+            | (q_is_state_out & (cross_step | (same_step & (kv_is_img_or_think | kv_is_state_out))))
+            | (q_is_action_out & (cross_step | (same_step & (kv_is_img_or_think | kv_is_first_k_state | kv_is_action_out))))
+            | (q_is_real_action & (cross_step | (same_step & kv_is_img_or_think)))
+        )
+
+        if history_len is not None:
+            full_mask = full_mask & ((q_step - kv_step) <= history_len)
+
+        return is_sink | full_mask
+
+    return _mask
+
+
 class PolicyStaMoFutureCausalTransformer(PolicyCausalTransformer):
     """
     Policy Transformer with N future StaMo state representation prediction heads.
@@ -1175,6 +1239,40 @@ class PolicyStaMoFutureCausalTransformer(PolicyCausalTransformer):
                 BLOCK_SIZE=self.config.mask_block_size,
                 device=self.device,
             )
+
+    def set_n_future_attend(self, n_future_attend: int):
+        """Set inference-time s0 visibility for a0.
+
+        n_future_attend=0 : a0 sees no s0 tokens (measures pure co-training benefit).
+        n_future_attend=k : a0 sees first k s0 tokens.
+        n_future_attend=N : same as training (all N s0 tokens visible).
+        Recomputes block masks for all transformer layers.
+        """
+        N = self.n_future_state_tokens
+        assert 0 <= n_future_attend <= N, f"n_future_attend must be in [0, {N}]"
+        if n_future_attend == N:
+            self._mask_fn = _img_policy_stamo_future_causal_mask
+        else:
+            k = n_future_attend
+
+            def _mask_fn_k(
+                layer_idx, n_img_tokens, n_thinking_tokens, n_action_tokens,
+                history_len=None, n_text_tokens=0, n_kv_sink_tokens=0, n_future_state_tokens=1,
+            ):
+                return _img_policy_stamo_future_causal_mask_k_attend(
+                    layer_idx=layer_idx,
+                    n_img_tokens=n_img_tokens,
+                    n_thinking_tokens=n_thinking_tokens,
+                    n_action_tokens=n_action_tokens,
+                    history_len=history_len,
+                    n_text_tokens=n_text_tokens,
+                    n_kv_sink_tokens=n_kv_sink_tokens,
+                    n_future_state_tokens=n_future_state_tokens,
+                    n_future_attend=k,
+                )
+
+            self._mask_fn = _mask_fn_k
+        self._assign_layer_masks()
 
     def forward(
         self,
