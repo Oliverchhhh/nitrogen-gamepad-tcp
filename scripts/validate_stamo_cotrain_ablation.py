@@ -222,7 +222,7 @@ def main():
     model.eval()
 
     # Build dataloader via Stage3DataModule
-    datamodule = Stage3DataModule(config, data_dir=args.data_folder)
+    datamodule = Stage3DataModule(config)
     datamodule.setup("validate")
     val_loaders = datamodule.val_dataloader()
     if isinstance(val_loaders, list):
