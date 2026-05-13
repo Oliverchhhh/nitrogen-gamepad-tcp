@@ -28,9 +28,9 @@ import logging
 import os
 import sys
 
+import imageio
+import numpy as np
 import torch
-import torchvision.io as tvio
-import torchvision.transforms.functional as tvF
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -57,29 +57,29 @@ def iter_video_chunks(dataset_dir: str, video_name: str):
             yield root, os.path.join(root, video_name)
 
 
-def load_video_frames(video_path: str) -> torch.Tensor:
-    """Load all frames from a video. Returns [T, 3, H, W] float32 in [0, 1]."""
-    frames, _, _ = tvio.read_video(video_path, pts_unit="sec", output_format="TCHW")
-    # frames: [T, 3, H, W] uint8 in [0, 255]
-    return frames.float() / 255.0
-
-
 def encode_chunk(
     encoder,
     video_path: str,
     batch_size: int,
     device: str,
 ) -> torch.Tensor:
-    """Encode all frames in a video. Returns [T, FLAT_DIM] on CPU."""
-    frames = load_video_frames(video_path)  # [T, 3, H, W]
-    T = frames.shape[0]
+    """Encode all frames in a video via streaming to avoid OOM. Returns [T, FLAT_DIM] on CPU."""
     all_feats = []
-    for start in range(0, T, batch_size):
-        end = min(start + batch_size, T)
-        batch = frames[start:end].to(device)   # [B, 3, H, W]
-        embeds = encoder.encode(batch)          # [B, 2, 4096]
-        flat = embeds.reshape(embeds.shape[0], -1).cpu()  # [B, 8192]
-        all_feats.append(flat)
+    buf = []
+    reader = imageio.get_reader(video_path)
+    for frame in reader:
+        # frame: [H, W, 3] uint8 numpy array
+        buf.append(torch.from_numpy(frame.copy()).permute(2, 0, 1).float() / 255.0)
+        if len(buf) == batch_size:
+            batch = torch.stack(buf).to(device)         # [B, 3, H, W]
+            embeds = encoder.encode(batch)              # [B, 2, 4096]
+            all_feats.append(embeds.reshape(embeds.shape[0], -1).cpu())
+            buf = []
+    reader.close()
+    if buf:
+        batch = torch.stack(buf).to(device)
+        embeds = encoder.encode(batch)
+        all_feats.append(embeds.reshape(embeds.shape[0], -1).cpu())
     return torch.cat(all_feats, dim=0)  # [T, 8192]
 
 
