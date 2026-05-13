@@ -107,11 +107,9 @@ def evaluate_condition(
     model.bc_transformer.set_n_future_attend(n_attend)
     model.eval()
 
-    n_buttons = model.action_out_tokens_to_logits.__self__ if False else None
     metrics = DirectActionMetrics(
-        n_buttons=model.gamepad_direct_action_mapping.max_buttons,
-        n_stick_axes=4,
-        stick_bins=model.gamepad_direct_action_mapping.n_stick_bins,
+        n_buttons=model.n_direct_buttons,
+        n_stick_bins=model.n_direct_stick_bins,
     )
 
     total_action_loss = 0.0
