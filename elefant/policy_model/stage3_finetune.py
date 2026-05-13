@@ -2903,6 +2903,9 @@ class Stage3StaMoFutureVisionLightning(PolicyModelTrainer):
 
     _EXCLUDED_CKPT_PREFIX = "stamo_encoder"
 
+    def _get_transformer_mask_fn(self):
+        return None
+
     def __init__(
         self,
         config: LightningPolicyConfig,
