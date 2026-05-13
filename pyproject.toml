@@ -55,7 +55,7 @@ dependencies = [
     "psycopg[binary]==3.2.6",
     "psycopg-pool==3.2.6",
     "kornia==0.7.3",
-    "transformers @ git+https://github.com/huggingface/transformers@60b68e304cf4b6569b0660a13b558b929d4b0e77",
+    "transformers==4.51.3",
     "sentence-transformers >= 2.6.0",
     "accelerate",
     "deepgram-sdk",
