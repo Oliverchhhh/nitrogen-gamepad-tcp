@@ -56,7 +56,9 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 
 def _move_batch(batch, device):
     annotations = batch.action_annotations
-    if not isinstance(annotations, torch.Tensor):
+    if isinstance(annotations, torch.Tensor):
+        annotations = annotations.to(device)
+    else:
         annotations = StructuredAction(
             keys=annotations.keys.to(device),
             mouse_buttons=annotations.mouse_buttons.to(device),
